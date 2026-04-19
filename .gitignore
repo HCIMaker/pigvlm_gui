@@ -1,10 +1,10 @@
 # Reference data — kept locally, not tracked
 PigFarm_Sow-jiale-2026-02-08/
 PigFarm_Multi-jiale-2026-02-08/
-PigFarm_Multi-jiale-2026-02-08.7z
 PigFarm_Sow_Test-jiale-2026-04-17/
 sleap_label/
 archived/
+sleap-develop/
 
 # Local tooling / OS junk
 .claude/

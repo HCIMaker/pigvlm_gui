@@ -8,87 +8,56 @@ A Windows-side staging area for preparing **DeepLabCut (DLC) keypoint-tracking d
 
 Read `must_know.md` first — it is the authoritative spec for the DLC CSV format (3-row header for single-animal, 4-row for multi-animal, how occluded keypoints are represented, folder/filename conventions, and the server-side post-processing commands). Do not re-derive those rules from code.
 
-## The pipeline (end-to-end)
+## Key Docs — MUST READ BEFORE ANY TASK
+- `docs/MUST_KNOW.md` — Related rules of how deeplabcut consume ground truth data.
+- `docs/TASKS.md` — Task list with status and acceptance criteria
+- `docs/PROGRESS.md` — Record the current working state of CLAUDE. Update after every single task is tested and done successfully with note.
 
-```
-raw video (.mp4)                        server (D:\ or remote)
-    │
-    │  short_video_extraction.ipynb    (moviepy; hms_to_secs → subclip)
-    ▼
-clip.mp4  →  pre-extracted frames: img<NNN>.png  in a folder named after the clip
-    │
-    │  SLEAP GUI (external) — produces .slp files under sleap_label/single/ or sleap_label/mutli/
-    ▼
-.slp file
-    │
-    │  sleap_to_dlc_multi.py  (or sleap_to_dlc.py for single-only)
-    │    - copies frames into <DLC_PROJECT>/labeled-data/<clip_name>/
-    │    - writes CollectedData_<scorer>.csv beside them
-    │    - validates every CSV path resolves to a real image
-    ▼
-<DLC_PROJECT>/labeled-data/<clip_name>/
-    ├── img*.png
-    └── CollectedData_jiale.csv
-    │
-    │  (upload to server, then in `dlc` conda env:)
-    │  deeplabcut.convertcsv2h5(config, scorer="jiale")
-    │  python 2_create_project/csv_to_h5_official.py      ← server-side
-    │  python 2_create_project/check_labels_from_sleap.py ← server-side
-    │  python 3_training/create_training_dataset.py --project sow
-    │  CUDA_VISIBLE_DEVICES=0 python 3_training/train.py  --project sow
-    ▼
-trained DLC model
-```
+## Key Reference - MUST READ BEFORE CODING
+- sleap.ai: C:\Jiale\pigvlm_gui\pigvlm_gui\sleap-develop (local) ; https://github.com/talmolab/sleap (github)
+- deeplabcut: https://github.com/deeplabcut/deeplabcut
 
-The `2_create_project/` and `3_training/` scripts are **not in this repo** — they live on the server at `~/Jiale_Research/PigVLM/PigFarmDataProcessing/deeplabcut/`. Do not try to run them locally.
+## Key Rules
+- Use uv to create a virtual environment inside C:\Jiale\pigvlm_gui\pigvlm_gui\workspace for project implementation
+- Do not modify other code file outside workspace directory, they are here as reference.
+- We do not create from scratch, we modify based on the sleap gui with as indicated in the reference
 
-## DLC projects in this repo
+## Conventions
 
-Three DLC-layout directories (`config.yaml` + `labeled-data/` + `dlc-models/` + `training-datasets/` + `videos/`):
+### 1. Think Before Coding
 
-| Project | Mode | Bodyparts | Individuals |
-|---|---|---|---|
-| `PigFarm_Sow-jiale-2026-02-08/` | single-animal (`multianimalproject: false`) | `left_ear, right_ear, torso, hip` | — |
-| `PigFarm_Multi-jiale-2026-02-08/` | multi-animal (`multianimalproject: true`, `bodyparts: MULTI!`) | `multianimalbodyparts: head, torso, hip` | `sow, piglet1..piglet12` (13 total) |
-| `PigFarm_Sow_Test-jiale-2026-04-17/` | single-animal test project | same as Sow | — |
+**Don't assume. Don't hide confusion. Surface tradeoffs.**
 
-**Path gotcha in `config.yaml`:** `project_path` and `video_sets` keys use Linux server paths (e.g. `/home/jiale/Jiale_Research/...`). The `PigFarm_Sow` config has a Windows `project_path` line with the Linux one commented out — this is intentional so the conversion scripts can resolve paths locally. When adding new projects, keep both forms handy and do not let a Windows-only `project_path` leak back to the server.
+Before implementing:
+- State your assumptions explicitly. If uncertain, ask.
+- If multiple interpretations exist, present them - don't pick silently.
+- If a simpler approach exists, say so. Push back when warranted.
+- If something is unclear, stop. Name what's confusing. Ask.
 
-## The conversion scripts (what to edit, when)
+### 2. Simplicity First
 
-- `sleap_to_dlc_multi.py` — **the canonical script.** Handles both single- and multi-animal via the `MULTI_ANIMAL` toggle. Edit `SLP_FILE`, `SCORER`, `MULTI_ANIMAL`, and the `SOW_DLC_PROJECT` / `MULTI_DLC_PROJECT` constants at the top.
-- `sleap_to_dlc.py` — single-animal only, kept as a simpler reference.
-- `sleap_to_dlc.ipynb` / `sleap_to_dlc_multi.ipynb` — interactive versions of the above; the `.py` files are the ones to run non-interactively.
-- `short_video_extraction.ipynb` — trims a long surveillance clip down to a labeling-sized window. Edit `input_video`, `output_video`, `start_time`, `end_time`.
+**Minimum code that solves the problem. Nothing speculative.**
 
-### Multi-animal subtlety — trackless SLEAP files
+- No features beyond what was asked.
+- No abstractions for single-use code.
+- No "flexibility" or "configurability" that wasn't requested.
+- No error handling for impossible scenarios.
+- If you write 200 lines and it could be 50, rewrite it.
 
-SLEAP `.slp` files from image-folder projects usually have **no tracks** (`labels.tracks == []`). In that case the converter falls back to **instance-order mapping**: instance 0 in each frame → `individuals[0]` (sow), instance 1 → `individuals[1]` (piglet1), etc. This means the human labeler **must label the sow first in every frame, then piglets in the same order throughout**. If the SLEAP file *does* have tracks, `TRACK_NAME_MAP` or auto-detection (exact name match first, then ordered fill) decides the mapping — see `build_track_mapping()`.
+Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
-For a single labeled frame the converter only writes the individuals that were actually labeled; missing ones get NaN via `df.reindex(columns=all_columns)`.
+### 3. Surgical Changes
 
-### Frame filename handling
+**Touch only what you must. Clean up only your own mess.**
 
-The converter preserves `img<NNN>.png` filenames as-is. Other patterns (`frame_000050.png`, `000050.png`, etc.) are renamed to `img<NNNN>.png` using `parse_frame_index()` (first integer in the stem, zero-padded to 4). The CSV row index uses the relative path `labeled-data/<folder>/<img_name>`.
+When editing existing code:
+- Don't "improve" adjacent code, comments, or formatting.
+- Don't refactor things that aren't broken.
+- Match existing style, even if you'd do it differently.
+- If you notice unrelated dead code, mention it - don't delete it.
 
-## Running conversions
+When your changes create orphans:
+- Remove imports/variables/functions that YOUR changes made unused.
+- Don't remove pre-existing dead code unless asked.
 
-No virtualenv or build system — scripts are run directly. Required packages:
-
-```bash
-pip install sleap-io pandas numpy pyyaml moviepy
-python sleap_to_dlc_multi.py   # edit the top-of-file configuration first
-```
-
-The script ends with a path-validation pass: every row in the generated CSV is resolved against the filesystem, and the script exits non-zero if any image is missing. Treat that failure as "DLC will crash later" — fix the image placement, do not bypass the check.
-
-## Naming & typos to be aware of
-
-- The SLEAP subdirectory is spelled `sleap_label/mutli/` (not `multi/`) — don't "fix" it without also updating the hardcoded paths in the multi-animal notebook.
-- Clip/folder names follow `ch07_Crate08_<start>_<end>_clip_<HHhMMmSSs>` — this exact string appears in the SLEAP `.slp`, the `labeled-data/` subfolder, the CSV row index, and `video_sets` in `config.yaml`. They must all match.
-
-## Do not
-
-- Do not mock or synthesize the reference CSVs — use the real ones on the server (see `must_know.md` §8) to verify format.
-- Do not run `deeplabcut.create_new_project` or any training step locally — this machine is Windows without the DLC conda env. Those are server operations.
-- Do not round keypoint coordinates to integers. DLC expects sub-pixel floats.
+The test: Every changed line should trace directly to the user's request.
