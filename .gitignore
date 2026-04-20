@@ -5,6 +5,7 @@ PigFarm_Sow_Test-jiale-2026-04-17/
 sleap_label/
 archived/
 sleap-develop/
+workspace/sleap/.venv
 
 # Local tooling / OS junk
 .claude/

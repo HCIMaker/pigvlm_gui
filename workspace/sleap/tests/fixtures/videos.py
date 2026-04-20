@@ -1,0 +1,91 @@
+import pytest
+
+from sleap_io import Video
+from sleap.io.format.filehandle import FileHandle
+
+TEST_H5_FILE = "tests/data/hdf5_format_v1/training.scale=0.50,sigma=10.h5"
+TEST_H5_DSET = "/box"
+TEST_H5_CONFMAPS = "/confmaps"
+TEST_H5_AFFINITY = "/pafs"
+TEST_H5_INPUT_FORMAT = "channels_first"
+TEST_SMALL_ROBOT3_FRAME_H5 = (
+    "tests/data/hdf5_format_v1/small_robot.000_small_robot_3_frame.analysis.h5"
+)
+
+
+@pytest.fixture
+def small_robot_3_frame_hdf5():
+    return FileHandle(filename=TEST_SMALL_ROBOT3_FRAME_H5)
+
+
+@pytest.fixture
+def hdf5_file_path():
+    return TEST_H5_FILE
+
+
+@pytest.fixture
+def hdf5_vid():
+    return Video.from_filename(filename=TEST_H5_FILE, dataset=TEST_H5_DSET)
+
+
+@pytest.fixture
+def hdf5_confmaps():
+    return Video.from_filename(
+        filename=TEST_H5_FILE,
+        dataset=TEST_H5_CONFMAPS,
+        input_format=TEST_H5_INPUT_FORMAT,
+    )
+
+
+@pytest.fixture
+def hdf5_affinity():
+    return Video.from_filename(
+        TEST_H5_FILE,
+        dataset=TEST_H5_AFFINITY,
+        input_format=TEST_H5_INPUT_FORMAT,
+    )
+
+
+TEST_SMALL_ROBOT_MP4_FILE = "tests/data/videos/small_robot.mp4"
+TEST_SMALL_CENTERED_PAIR_VID = "tests/data/videos/centered_pair_small.mp4"
+
+
+@pytest.fixture
+def small_robot_mp4_path():
+    return TEST_SMALL_ROBOT_MP4_FILE
+
+
+@pytest.fixture
+def small_robot_mp4_vid() -> Video:
+    return Video.from_filename(TEST_SMALL_ROBOT_MP4_FILE)
+
+
+@pytest.fixture
+def centered_pair_vid_path():
+    return TEST_SMALL_CENTERED_PAIR_VID
+
+
+@pytest.fixture
+def centered_pair_vid() -> Video:
+    return Video.from_filename(TEST_SMALL_CENTERED_PAIR_VID)
+
+
+TEST_SMALL_ROBOT_SIV_FILE0 = "tests/data/videos/robot0.jpg"
+TEST_SMALL_ROBOT_SIV_FILE1 = "tests/data/videos/robot1.jpg"
+TEST_SMALL_ROBOT_SIV_FILE2 = "tests/data/videos/robot2.jpg"
+TEST_SMALL_ROBOT_VID = "tests/data/videos/small_robot_3_frame.mp4"
+
+
+@pytest.fixture
+def small_robot_single_image_vid():
+    filenames = [
+        TEST_SMALL_ROBOT_SIV_FILE0,
+        TEST_SMALL_ROBOT_SIV_FILE1,
+        TEST_SMALL_ROBOT_SIV_FILE2,
+    ]
+    return Video.from_filename(filenames)
+
+
+@pytest.fixture
+def small_robot_3_frame_vid():
+    return Video.from_filename(TEST_SMALL_ROBOT_VID)

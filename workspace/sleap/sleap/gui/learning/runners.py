@@ -1,0 +1,1348 @@
+"""Run training/inference in background process via CLI."""
+
+import abc
+import attr
+import os
+import sys
+from omegaconf import OmegaConf
+from copy import deepcopy
+import psutil
+import json
+import subprocess
+import tempfile
+import time
+import shutil
+import yaml
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Callable, Dict, List, Optional, Text, Tuple
+import logging
+from sleap.util import show_sleap_nn_installation_message
+
+from qtpy import QtCore, QtWidgets
+
+from sleap_io import Labels, Video, LabeledFrame
+import sleap_io as sio
+from sleap.gui.learning.configs import ConfigFileInfo
+
+from sleap.gui.config_utils import filter_cfg
+
+logger = logging.getLogger(__name__)
+
+
+class InferenceProgressDialog(QtWidgets.QDialog):
+    """Custom progress dialog for inference with log display.
+
+    Features:
+    - Taller progress bar for better visibility
+    - Scrollable log area showing subprocess output (dark theme)
+    - OK button (enabled when done) and Cancel button (disabled when done)
+    """
+
+    # Signal emitted when cancel is requested
+    cancelRequested = QtWidgets.QDialog.rejected  # Reuse rejected signal
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Running Inference")
+        self.setMinimumWidth(600)
+        self.setMinimumHeight(500)
+
+        self._canceled = False
+        self._finished = False
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Status label (centered)
+        self._label = QtWidgets.QLabel("Initializing...")
+        self._label.setWordWrap(True)
+        self._label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self._label)
+
+        # Progress bar with minimum height for better visibility
+        self._progress_bar = QtWidgets.QProgressBar()
+        self._progress_bar.setMinimumHeight(25)
+        self._progress_bar.setRange(0, 1)
+        layout.addWidget(self._progress_bar)
+
+        # Log area
+        log_label = QtWidgets.QLabel("Log output:")
+        layout.addWidget(log_label)
+
+        self._log_area = QtWidgets.QPlainTextEdit()
+        self._log_area.setReadOnly(True)
+        self._log_area.setMinimumHeight(250)
+        # Dark theme: light grey text on black background
+        self._log_area.setStyleSheet(
+            "QPlainTextEdit { background-color: #1e1e1e; color: #a0a0a0; }"
+        )
+        # Use monospace font, smaller size
+        font = self._log_area.font()
+        font.setFamily("Consolas, Monaco, monospace")
+        font.setPointSize(8)
+        self._log_area.setFont(font)
+        layout.addWidget(self._log_area, stretch=1)
+
+        # OK and Cancel buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        button_layout.addStretch()
+
+        self._ok_button = QtWidgets.QPushButton("OK")
+        self._ok_button.setEnabled(False)  # Disabled until inference completes
+        self._ok_button.clicked.connect(self.accept)
+        button_layout.addWidget(self._ok_button)
+
+        self._cancel_button = QtWidgets.QPushButton("Cancel")
+        self._cancel_button.clicked.connect(self._on_cancel)
+        button_layout.addWidget(self._cancel_button)
+
+        layout.addLayout(button_layout)
+
+    def _on_cancel(self):
+        """Handle cancel button click."""
+        self._canceled = True
+        self._cancel_button.setEnabled(False)
+        self._cancel_button.setText("Canceling...")
+
+    def wasCanceled(self) -> bool:
+        """Return whether the dialog was canceled."""
+        return self._canceled
+
+    def setLabelText(self, text: str):
+        """Set the status label text."""
+        self._label.setText(text)
+
+    def setMaximum(self, maximum: int):
+        """Set the progress bar maximum value."""
+        self._progress_bar.setMaximum(maximum)
+
+    def setValue(self, value: int):
+        """Set the progress bar current value."""
+        self._progress_bar.setValue(value)
+
+    def appendLog(self, text: str):
+        """Append text to the log area and auto-scroll."""
+        if not text:
+            return
+        self._log_area.appendPlainText(text)
+        # Auto-scroll to bottom
+        scrollbar = self._log_area.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def setFinished(
+        self,
+        success: bool = True,
+        new_frame_count: int = 0,
+        total_frame_count: int = 0,
+    ):
+        """Mark inference as finished and update button states.
+
+        Args:
+            success: Whether inference completed successfully.
+            new_frame_count: Number of frames with predicted instances.
+            total_frame_count: Total number of frames processed.
+        """
+        self._finished = True
+        self._ok_button.setEnabled(True)
+        self._cancel_button.setEnabled(False)
+        if success:
+            no_result_count = max(0, total_frame_count - new_frame_count)
+            msg = (
+                f"<b>Inference complete!</b><br><br>"
+                f"Inference ran on {total_frame_count:,} frames.<br>"
+                f"Instances were predicted on {new_frame_count:,} frames "
+                f"({no_result_count:,} frame{'s' if no_result_count != 1 else ''} "
+                f"with no instances found)."
+            )
+            self._label.setText(msg)
+        else:
+            self._label.setText("<b>Inference failed or was canceled.</b>")
+
+
+class InferenceWorker(QtCore.QThread):
+    """Background worker thread for running inference without blocking UI."""
+
+    # Signals for communicating with main thread
+    progressUpdate = QtCore.Signal(int, int)  # (current, total)
+    statusUpdate = QtCore.Signal(str)  # status message (HTML)
+    logOutput = QtCore.Signal(str)  # log line
+    # (success, new_frame_count, total_frame_count)
+    finished = QtCore.Signal(bool, int, int)
+
+    def __init__(
+        self,
+        inference_task: "InferenceTask",
+        items_for_inference: "ItemsForInference",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._inference_task = inference_task
+        self._items_for_inference = items_for_inference
+        self._canceled = False
+        self._new_frame_count = 0
+        self._total_frame_count = items_for_inference.total_frame_count
+        self._current_process = None  # Track current subprocess for cancellation
+
+    def cancel(self):
+        """Request cancellation of inference."""
+        self._canceled = True
+        # Kill the subprocess immediately if running
+        # This is needed because readline() blocks and won't check _canceled
+        if self._current_process is not None:
+            kill_process(self._current_process.pid)
+
+    def run(self):
+        """Run inference in background thread."""
+        try:
+            for i, item_for_inference in enumerate(self._items_for_inference.items):
+                if self._canceled:
+                    self.finished.emit(False, -1, self._total_frame_count)
+                    return
+
+                # Run inference for this item
+                predictions_path, ret = self._run_inference_item(
+                    item_for_inference, i, len(self._items_for_inference.items)
+                )
+
+                if ret == "canceled":
+                    self.finished.emit(False, -1, self._total_frame_count)
+                    return
+                elif ret != "success":
+                    self.logOutput.emit(f"Error: Inference failed with code {ret}")
+                    self.finished.emit(False, 0, self._total_frame_count)
+                    return
+
+            # Merge results
+            self._new_frame_count = self._inference_task.merge_results()
+            self.finished.emit(True, self._new_frame_count, self._total_frame_count)
+
+        except Exception as e:
+            self.logOutput.emit(f"Error: {e}")
+            self.finished.emit(False, 0, self._total_frame_count)
+
+    def _run_inference_item(
+        self, item_for_inference: "ItemForInference", item_idx: int, total_items: int
+    ) -> Tuple[str, str]:
+        """Run inference for a single item, emitting progress signals."""
+        cli_args, output_path = self._inference_task.make_predict_cli_call(
+            item_for_inference, gui=True
+        )
+
+        self.logOutput.emit(f"Running: {' '.join(cli_args)}")
+
+        # Run inference CLI capturing output
+        # Use unbuffered mode for real-time log streaming
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        with subprocess.Popen(
+            cli_args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Merge stderr into stdout
+            text=True,  # Text mode (required for line buffering)
+            bufsize=1,  # Line buffered
+            env=env,
+        ) as proc:
+            # Track process for cancellation from main thread
+            self._current_process = proc
+
+            while proc.poll() is None:
+                if self._canceled:
+                    kill_process(proc.pid)
+                    self._current_process = None
+                    return "", "canceled"
+
+                # Read line (already decoded in text mode)
+                line = proc.stdout.readline().rstrip()
+
+                is_json = False
+                if line.startswith("{"):
+                    try:
+                        line_data = json.loads(line)
+                        is_json = True
+                    except (json.JSONDecodeError, ValueError):
+                        is_json = False
+
+                if is_json:
+                    # Extract progress info
+                    n_processed = line_data.get("n_processed")
+                    n_total = line_data.get("n_total")
+                    rate = line_data.get("rate")
+                    eta = line_data.get("eta")
+
+                    if n_processed is not None and n_total is not None:
+                        self.progressUpdate.emit(n_processed, n_total)
+
+                        # Build status message (all on one line with spacing)
+                        msg = f"Predicted: <b>{n_processed:,}/{n_total:,}</b>"
+                        if rate is not None and eta is not None:
+                            eta_mins, eta_secs = divmod(eta, 60)
+                            if eta_mins > 60:
+                                eta_hours, eta_mins = divmod(eta_mins, 60)
+                                eta_str = f"{int(eta_hours)}h {int(eta_mins):02}m"
+                            elif eta_mins > 0:
+                                eta_str = f"{int(eta_mins)}m {int(eta_secs):02}s"
+                            else:
+                                eta_str = f"{int(eta_secs)}s"
+                            msg += f" &nbsp; &nbsp; FPS: <b>{rate:.1f}</b>"
+                            msg += f" &nbsp; &nbsp; ETA: <b>{eta_str}</b>"
+                        self.statusUpdate.emit(msg)
+                else:
+                    # Non-JSON output goes to log
+                    if line:
+                        self.logOutput.emit(line)
+
+                time.sleep(0.02)
+
+            # Clear process reference now that it's finished
+            self._current_process = None
+            success = proc.returncode == 0
+
+        if success:
+            # Load frames from inference into results list
+            new_inference_labels = sio.load_slp(output_path)
+            self._inference_task.results.extend(new_inference_labels.labeled_frames)
+
+        ret = "success" if success else proc.returncode
+        return output_path, ret
+
+
+def get_timestamp() -> Text:
+    """Return the date and time as a string."""
+    return datetime.now().strftime("%y%m%d_%H%M%S")
+
+
+def setup_new_run_folder(
+    config: OmegaConf, base_run_name: Optional[Text] = None
+) -> Text:
+    """Create a new run folder from config.
+
+    Args:
+        config: Training configuration with trainer_config.save_ckpt and ckpt_dir.
+        base_run_name: Optional suffix to append (e.g., "centroid.n=10").
+
+    Returns:
+        Path to the new run folder, or None if save_ckpt is False.
+    """
+    run_path = None
+    if config.trainer_config.save_ckpt:
+        # Check if user specified a custom run_name in the config
+        user_run_name = OmegaConf.select(
+            config, "trainer_config.run_name", default=None
+        )
+        if user_run_name and user_run_name not in ("", "None"):
+            # Use user-specified run_name
+            run_name = user_run_name
+        else:
+            # Generate fresh run name: YYMMDD_HHMMSS
+            run_name = get_timestamp()
+
+        # Always append base_run_name suffix (contains model type like "centroid.n=10")
+        # This ensures unique names for multi-model pipelines like top-down
+        if isinstance(base_run_name, str):
+            run_name = run_name + "." + base_run_name
+
+        # Build run path (always use fresh name, don't prepend old run_name)
+        run_path = (Path(config.trainer_config.ckpt_dir) / run_name).as_posix()
+
+    return run_path
+
+
+def kill_process(pid: int):
+    """Force kill a running process and any child processes.
+
+    Args:
+        pid: A process ID.
+    """
+    try:
+        proc_ = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        # Process already exited, nothing to kill
+        return
+
+    for subproc_ in proc_.children(recursive=True):
+        try:
+            subproc_.kill()
+        except psutil.NoSuchProcess:
+            # Child process already exited
+            pass
+
+    try:
+        proc_.kill()
+    except psutil.NoSuchProcess:
+        # Process already exited (possibly due to children being killed)
+        pass
+
+
+@attr.s(auto_attribs=True)
+class ItemForInference(abc.ABC):
+    """Abstract base class for item on which we can run inference via CLI.
+
+    Must have `path` and `cli_args` properties, used to build CLI call.
+    """
+
+    @property
+    @abc.abstractmethod
+    def path(self) -> Text:
+        pass
+
+    @property
+    @abc.abstractmethod
+    def cli_args(self) -> List[Text]:
+        pass
+
+
+@attr.s(auto_attribs=True)
+class VideoItemForInference(ItemForInference):
+    """Encapsulate data about video on which inference should run.
+
+    This allows for inference on an arbitrary list of frames from video.
+
+    Attributes:
+        video: the :py:class:`Video` object (which already stores its own path)
+        frames: list of frames for inference; if None, then all frames are used
+        use_absolute_path: whether to use absolute path for inference cli call
+        video: The :py:class:`Video` object (which already stores its own path)
+        frames: List of frames for inference; if None, then all frames are used
+        labels_path: Path to .slp project; if None, then use video path instead.
+        video_idx: Video index for inference; if None, then first video is used. Only
+            used if labels_path is specified.
+    """
+
+    video: Video
+    frames: Optional[List[int]] = None
+    use_absolute_path: bool = False
+    labels_path: Optional[str] = None
+    video_idx: int = 0
+
+    @property
+    def path(self):
+        if self.labels_path is not None:
+            return self.labels_path
+        if self.use_absolute_path:
+            return os.path.abspath(self.video.filename)
+        return self.video.filename
+
+    @property
+    def cli_args(self):
+        arg_list = list()
+        arg_list.extend(["--data_path", f"{self.path}"])
+        if self.labels_path is not None:
+            arg_list.extend(["--video_index", str(self.video_idx)])
+
+        # TODO: better support for video params
+        if (
+            self.video.backend
+            and hasattr(self.video.backend, "dataset")
+            and self.video.backend.dataset
+        ):
+            arg_list.extend(("--video_dataset", self.video.backend.dataset))
+
+        if (
+            self.video.backend
+            and hasattr(self.video.backend, "input_format")
+            and self.video.backend.input_format
+        ):
+            arg_list.extend(("--video_input_format", self.video.backend.input_format))
+
+        # -Y represents endpoint of [X, Y) range but inference cli expects
+        # [X, Y-1] range (so add 1 since negative).
+        frame_int_list = list(set([i + 1 if i < 0 else i for i in self.frames]))
+        frame_int_list.sort(reverse=min(frame_int_list) < 0)  # Assumes len of 2 if neg.
+
+        arg_list.extend(("--frames", ",".join(map(str, frame_int_list))))
+
+        return arg_list
+
+
+@attr.s(auto_attribs=True)
+class DatasetItemForInference(ItemForInference):
+    """Encapsulate data about frame selection based on dataset data.
+
+    Attributes:
+        labels_path: path to the saved :py:class:`Labels` dataset.
+        frame_filter: which subset of frames to get from dataset, supports
+            * "user" - frames with user-labeled instances
+            * "suggested" - frames marked as suggestions (without user labels)
+            * "predicted" - frames with predicted instances
+        use_absolute_path: whether to use absolute path for inference cli call.
+    """
+
+    labels_path: str
+    frame_filter: str = "user"
+    use_absolute_path: bool = False
+
+    @property
+    def path(self):
+        if self.use_absolute_path:
+            return os.path.abspath(self.labels_path)
+        return self.labels_path
+
+    @property
+    def cli_args(self):
+        args_list = ["--data_path", self.path]
+        if self.frame_filter == "user":
+            args_list.append("--only_labeled_frames")
+        elif self.frame_filter == "suggested":
+            args_list.append("--only_suggested_frames")
+        elif self.frame_filter == "predicted":
+            args_list.append("--only_predicted_frames")
+        return args_list
+
+
+@attr.s(auto_attribs=True)
+class ItemsForInference:
+    """Encapsulates list of items for inference."""
+
+    items: List[ItemForInference]
+    total_frame_count: int
+
+    def __len__(self):
+        return len(self.items)
+
+    @classmethod
+    def from_video_frames_dict(
+        cls,
+        video_frames_dict: Dict[Video, List[int]],
+        total_frame_count: int,
+        labels: Labels,
+        labels_path: Optional[str] = None,
+    ):
+        items = []
+        for video, frames in video_frames_dict.items():
+            if frames:
+                items.append(
+                    VideoItemForInference(
+                        video=video,
+                        frames=frames,
+                        labels_path=labels_path,
+                        video_idx=labels.videos.index(video),
+                    )
+                )
+        return cls(items=items, total_frame_count=total_frame_count)
+
+
+@attr.s(auto_attribs=True)
+class InferenceTask:
+    """Encapsulates all data needed for running inference via CLI."""
+
+    trained_job_paths: List[str]
+    inference_params: Dict[str, Any] = attr.ib(default=attr.Factory(dict))
+    labels: Optional[Labels] = None
+    labels_filename: Optional[str] = None
+    results: List[LabeledFrame] = attr.ib(default=attr.Factory(list))
+
+    def make_predict_cli_call(
+        self,
+        item_for_inference: ItemForInference,
+        output_path: Optional[str] = None,
+        gui: bool = True,
+    ) -> List[Text]:
+        """Makes list of CLI arguments needed for running inference."""
+        cli_args = [
+            "sleap",
+            "track",
+        ]
+        if gui:
+            cli_args.append("--gui")
+        cli_args.extend(
+            item_for_inference.cli_args
+        )  # sample inference CLI args: ['--data_path', '...', '--video_index', '0',
+        # '--video_input_format', 'channels_last', '--frames', '0,-2559']
+
+        # Make path where we'll save predictions (if not specified)
+        if output_path is None:
+            if self.labels_filename:
+                # Make a predictions directory next to the labels dataset file
+                predictions_dir = os.path.join(
+                    os.path.dirname(self.labels_filename), "predictions"
+                )
+                os.makedirs(predictions_dir, exist_ok=True)
+            else:
+                # Dataset filename wasn't given, so save predictions in same dir
+                # as the video
+                predictions_dir = os.path.dirname(item_for_inference.video.filename)
+
+            # Build filename with video name and timestamp
+            timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
+            video_name_prefix = ""
+            if "--video_index" in item_for_inference.cli_args:
+                video_index = int(
+                    item_for_inference.cli_args[
+                        item_for_inference.cli_args.index("--video_index") + 1
+                    ]
+                )
+                video_name_prefix = Path(self.labels.videos[video_index].filename).name
+            video_name_prefix = (
+                video_name_prefix + "_" if video_name_prefix != "" else ""
+            )
+            output_path = os.path.join(
+                predictions_dir,
+                f"{video_name_prefix}{os.path.basename(item_for_inference.path)}.{timestamp}."
+                "predictions.slp",
+            )
+
+        for job_path in self.trained_job_paths:
+            if (
+                job_path.endswith(".yaml")
+                or job_path.endswith(".json")
+                or job_path.endswith(".yml")
+            ):
+                job_path = str(
+                    Path(job_path).parent
+                )  # get the model ckpt folder path from the path of
+                # `training_config.yaml`
+            cli_args.extend(("--model_paths", job_path))
+
+        cli_args.extend(["-o", output_path])
+
+        if "_batch_size" in self.inference_params:
+            cli_args.extend(["--batch_size", str(self.inference_params["_batch_size"])])
+
+        if (
+            "_max_instances" in self.inference_params
+            and self.inference_params["_max_instances"] is not None
+        ):
+            cli_args.extend(
+                ["--max_instances", str(self.inference_params["_max_instances"])]
+            )
+
+        # Add exclude user labeled flag if set
+        # This tells sleap-nn to skip frames that have user labels
+        if self.inference_params.get("_exclude_user_labeled", False):
+            cli_args.append("--exclude_user_labeled")
+
+        # add tracking args
+        if (
+            "tracking.tracker" in self.inference_params
+            and self.inference_params["tracking.tracker"] != "none"
+        ):
+            cli_args.extend(["--tracking"])
+            cli_args.extend(
+                ["--track_matching_method", self.inference_params["tracking.match"]]
+            )
+            cli_args.extend(
+                [
+                    "--tracking_window_size",
+                    str(self.inference_params["tracking.track_window"]),
+                ]
+            )
+            if self.inference_params["tracking.max_tracks"] is not None:
+                cli_args.extend(["--candidates_method", "local_queues"])
+                cli_args.extend(
+                    ["--max_tracks", str(self.inference_params["tracking.max_tracks"])]
+                )
+            if "flow" in self.inference_params["tracking.tracker"]:
+                cli_args.extend(["--use_flow"])
+
+            if self.inference_params["tracking.post_connect_single_breaks"] == 1:
+                cli_args.extend(["--post_connect_single_breaks"])
+                # post_connect_single_breaks requires tracking_target_instance_count
+                if self.inference_params["tracking.max_tracks"] is not None:
+                    cli_args.extend(
+                        [
+                            "--tracking_target_instance_count",
+                            str(self.inference_params["tracking.max_tracks"]),
+                        ]
+                    )
+
+            if self.inference_params["tracking.robust"] != 1.0:
+                cli_args.extend(["--scoring_reduction", "robust_quantile"])
+                if self.inference_params["tracking.robust"] is not None:
+                    cli_args.extend(
+                        [
+                            "--robust_best_instance",
+                            str(self.inference_params["tracking.robust"]),
+                        ]
+                    )
+
+            if self.inference_params["tracking.similarity"] == "oks":
+                cli_args.extend(["--features", "keypoints"])
+                cli_args.extend(["--scoring_method", "oks"])
+            elif self.inference_params["tracking.similarity"] == "centroids":
+                cli_args.extend(["--features", "centroids"])
+                cli_args.extend(["--scoring_method", "euclidean_dist"])
+            elif self.inference_params["tracking.similarity"] == "iou":
+                cli_args.extend(["--features", "bboxes"])
+                cli_args.extend(["--scoring_method", "iou"])
+
+        # Add filter_overlapping args (independent of tracking)
+        if self.inference_params.get("filter_overlapping", False):
+            cli_args.append("--filter_overlapping")
+            method = self.inference_params.get("filter_overlapping_method", "iou")
+            cli_args.extend(["--filter_overlapping_method", method])
+            threshold = self.inference_params.get("filter_overlapping_threshold", 0.8)
+            cli_args.extend(["--filter_overlapping_threshold", str(threshold)])
+
+        return cli_args, output_path
+
+    def predict_subprocess(
+        self,
+        item_for_inference: ItemForInference,
+        append_results: bool = False,
+        waiting_callback: Optional[Callable] = None,
+        gui: bool = True,
+    ) -> Tuple[Text, bool]:
+        """Runs inference in a subprocess."""
+        cli_args, output_path = self.make_predict_cli_call(item_for_inference, gui=gui)
+
+        print("Command line call:")
+        print(" ".join(cli_args))
+        print()
+
+        # Run inference CLI capturing output.
+        with subprocess.Popen(cli_args, stdout=subprocess.PIPE) as proc:
+            # Poll until finished.
+            while proc.poll() is None:
+                # Read line.
+                line = proc.stdout.readline()
+                line = line.decode().rstrip()
+
+                is_json = False
+                if line.startswith("{"):
+                    try:
+                        # Parse line.
+                        line_data = json.loads(line)
+                        is_json = True
+                    except (json.JSONDecodeError, ValueError):
+                        is_json = False
+
+                if not is_json:
+                    # Pass through non-json output.
+                    print(line)
+                    line_data = {"log_line": line} if line else {}
+
+                if waiting_callback is not None:
+                    # Pass line data to callback (log_line for non-JSON output).
+                    ret = waiting_callback(**line_data)
+
+                    if ret == "cancel":
+                        # Stop if callback returned cancel signal.
+                        kill_process(proc.pid)
+                        print(f"Killed PID: {proc.pid}")
+                        return "", "canceled"
+                time.sleep(0.05)
+
+            print(f"Process return code: {proc.returncode}")
+            success = proc.returncode == 0
+
+        if success and append_results:
+            # Load frames from inference into results list
+            new_inference_labels = sio.load_slp(output_path)
+            self.results.extend(new_inference_labels.labeled_frames)
+
+        # Return "success" or return code if failed.
+        ret = "success" if success else proc.returncode
+        return output_path, ret
+
+    def merge_results(self) -> int:
+        """Merges result frames into labels dataset.
+
+        Returns:
+            Number of frames with predicted instances.
+        """
+
+        def remove_empty_instances_and_frames(lf: LabeledFrame):
+            """Removes instances without visible points and empty frames."""
+            lf.remove_empty_instances()
+            return len(lf.instances) > 0
+
+        # Remove instances without graphable points and any frames without instances.
+        self.results = list(
+            filter(lambda lf: remove_empty_instances_and_frames(lf), self.results)
+        )
+        new_labels = Labels(self.results)
+
+        # Handle clear all predictions before merging.
+        # Skip if target is "nothing" (no inference ran, so don't clear predictions).
+        target_key = self.inference_params.get("_predict_target", "")
+        clear_all = self.inference_params.get("_clear_all_first", False)
+        if clear_all and target_key != "nothing":
+            self.labels.remove_predictions()
+
+        # Merge pred results into base labels
+        # Use replace_predictions when replacing, keep_both when adding
+        # See: https://sleap.ai/develop/api/sleap_io.model.labels.html#sleap_io.model.labels.Labels.merge
+        prediction_mode = self.inference_params.get("_prediction_mode", "add")
+        if prediction_mode == "replace":
+            self.labels.merge(new_labels, frame="replace_predictions")
+        else:
+            self.labels.merge(new_labels, frame="keep_both")
+
+        return len(self.results)
+
+
+def write_pipeline_files(
+    output_dir: str,
+    labels_filename: str,
+    config_info_list: List[ConfigFileInfo],
+    inference_params: Dict[str, Any],
+    items_for_inference: ItemsForInference,
+    num_user_labeled_frames: Optional[int] = None,
+):
+    """Writes the config files and scripts for manually running pipeline.
+
+    Args:
+        output_dir: Directory to write the files to.
+        labels_filename: Path to the labels file.
+        config_info_list: List of ConfigFileInfo objects for each model.
+        inference_params: Dictionary of inference parameters.
+        items_for_inference: ItemsForInference object with inference targets.
+        num_user_labeled_frames: Number of user-labeled frames (for default run name).
+    """
+
+    # Use absolute path for all files that aren't contained in the output dir.
+    labels_filename = os.path.abspath(labels_filename)
+
+    # Preserve current working directory and change working directory to the
+    # output directory, so we can set local paths relative to that.
+    old_cwd = os.getcwd()
+    os.chdir(output_dir)
+
+    new_cfg_filenames = []
+    train_script = "#!/bin/bash\n"
+
+    # Add head type to save path suffix to prevent overwriting.
+    for cfg_info in config_info_list:
+        if not cfg_info.dont_retrain:
+            # Update config.
+            cfg_run_name = OmegaConf.select(
+                cfg_info.config, "trainer_config.run_name", default=""
+            )
+            # If user provided a custom run_name, preserve it as-is.
+            # If not, clear it so setup_new_run_folder will generate default
+            # with format: timestamp.head_name
+            if not cfg_run_name or cfg_run_name == "None":
+                cfg_info.config.trainer_config.run_name = None
+
+    training_jobs = []
+    for cfg_info in config_info_list:
+        if cfg_info.dont_retrain:
+            # Use full absolute path to already trained model
+            trained_path = os.path.normpath(os.path.join(old_cwd, cfg_info.path))
+            new_cfg_filenames.append(trained_path)
+
+        else:
+            # We're training this model, so save config file...
+
+            # First we want to set the run folder so that we know where to find
+            # the model after it's trained.
+            # We'll use local path to the output directory (cwd).
+            # Note that setup_new_run_folder does things relative to cwd which
+            # is the main reason we're setting it to the output directory rather
+            # than just using normpath.
+            # cfg_info.config.outputs.runs_folder = ""
+            # Build base_run_name: head_name.n=X (matches training behavior)
+            base_run_name = cfg_info.head_name
+            if num_user_labeled_frames is not None:
+                base_run_name = f"{cfg_info.head_name}.n={num_user_labeled_frames}"
+            ckpt_path = setup_new_run_folder(
+                cfg_info.config, base_run_name=base_run_name
+            )
+            cfg_info.config.trainer_config.run_name = Path(ckpt_path).name
+            cfg_info.config.trainer_config.ckpt_dir = Path(ckpt_path).parent.as_posix()
+            # training.setup_new_run_folder(
+            #     cfg_info.config.outputs,
+            #     # base_run_name=f"{model_type}.n={len(labels.user_labeled_frames)}",
+            #     base_run_name=cfg_info.head_name,
+            # )
+
+            # Now we set the filename for the training config file
+            new_cfg_filename = f"{cfg_info.head_name}.yaml"
+
+            # Save the config file (convert to yaml)
+            try:
+                from sleap_nn.config.training_job_config import verify_training_cfg
+
+                # Save the config file
+                cfg_info.config = filter_cfg(cfg_info.config)
+                cfg = verify_training_cfg(cfg_info.config)
+                cfg.data_config.train_labels_path = [os.path.basename(labels_filename)]
+                OmegaConf.save(cfg, new_cfg_filename)
+
+                # Keep track of the path where we'll find the trained model
+                new_cfg_filenames.append(
+                    (
+                        Path(cfg_info.config.trainer_config.ckpt_dir)
+                        / cfg_info.config.trainer_config.run_name
+                    ).as_posix()
+                )
+
+                # Add a line to the script for training this model
+                # Quote values to handle special characters in Hydra overrides
+                train_script += (
+                    f"sleap train --config-name {new_cfg_filename} "
+                    f"--config-dir . "
+                    f"trainer_config.ckpt_dir='{Path(ckpt_path).parent.as_posix()}' "
+                    f"trainer_config.run_name='{Path(ckpt_path).name}' "
+                    "\n"
+                )
+
+                # Setup job params
+                training_jobs.append(
+                    {
+                        "cfg": new_cfg_filename,
+                        "run_path": (
+                            Path(cfg_info.config.trainer_config.ckpt_dir)
+                            / cfg_info.config.trainer_config.run_name
+                        ).as_posix(),
+                        "train_labels": os.path.basename(labels_filename),
+                    }
+                )
+            except ImportError:
+                show_sleap_nn_installation_message()
+                logger.error(
+                    "sleap-nn is not installed. This appears to be GUI-only install."
+                    "To enable training, please install SLEAP with the 'nn' dependency."
+                    "See the installation guide: https://docs.sleap.ai/latest/installation/"
+                )
+                return
+
+    # Write the script to train the models which need to be trained
+    with open(os.path.join(output_dir, "train-script.sh"), "w") as f:
+        f.write(train_script)
+
+    # Build the script for running inference
+    inference_script = "#!/bin/bash\n"
+
+    # Object with settings for inference
+    inference_task = InferenceTask(
+        labels_filename=labels_filename,
+        trained_job_paths=new_cfg_filenames,
+        inference_params=inference_params,
+    )
+
+    inference_jobs = []
+    for item_for_inference in items_for_inference.items:
+        if type(item_for_inference) == DatasetItemForInference:
+            data_path = labels_filename
+        else:
+            data_path = item_for_inference.path
+
+        # We want to save predictions in output dir so use local path
+        prediction_output_path = f"{os.path.basename(data_path)}.predictions.slp"
+
+        # Use absolute path to video
+        item_for_inference.use_absolute_path = True
+
+        # Get list of cli args
+        cli_args, _ = inference_task.make_predict_cli_call(
+            item_for_inference=item_for_inference,
+            output_path=prediction_output_path,
+        )
+        # And join them into a single call to inference
+        inference_script += " ".join(cli_args) + "\n"
+        # Setup job params
+        only_suggested_frames = False
+        if type(item_for_inference) == DatasetItemForInference:
+            only_suggested_frames = item_for_inference.frame_filter == "suggested"
+
+        # TODO: support frame ranges, user-labeled frames
+        tracking_args = {
+            k: v for k, v in inference_params.items() if k.startswith("tracking.")
+        }
+        inference_jobs.append(
+            {
+                "data_path": os.path.basename(data_path),
+                "models": [Path(p).as_posix() for p in new_cfg_filenames],
+                "output_path": prediction_output_path,
+                "type": (
+                    "labels"
+                    if type(item_for_inference) == DatasetItemForInference
+                    else "video"
+                ),
+                "only_suggested_frames": only_suggested_frames,
+                "tracking": tracking_args,
+            }
+        )
+
+    # And write it
+    with open(os.path.join(output_dir, "inference-script.sh"), "w") as f:
+        f.write(inference_script)
+
+    # Save jobs.yaml
+    jobs = {"training": training_jobs, "inference": inference_jobs}
+    with open(os.path.join(output_dir, "jobs.yaml"), "w") as f:
+        yaml.dump(jobs, f)
+
+    # Restore the working directory
+    os.chdir(old_cwd)
+
+
+def run_learning_pipeline(
+    labels_filename: str,
+    labels: Labels,
+    config_info_list: List[ConfigFileInfo],
+    inference_params: Dict[str, Any],
+    items_for_inference: ItemsForInference,
+) -> int:
+    """Runs training (as needed) and inference.
+
+    Args:
+        labels_filename: Path to already saved current labels object.
+        labels: The current labels object; results will be added to this.
+        config_info_list: List of ConfigFileInfo with configs for training
+            and inference.
+        inference_params: Parameters to pass to inference.
+        frames_to_predict: Dict that gives list of frame indices for each video.
+
+    Returns:
+        Number of new frames added to labels.
+
+    """
+
+    if "movenet" in inference_params["_pipeline"]:
+        trained_job_paths = [inference_params["_pipeline"]]
+
+    else:
+        # Train the TrainingJobs
+        trained_job_paths = run_gui_training(
+            labels_filename=labels_filename,
+            labels=labels,
+            config_info_list=config_info_list,
+            inference_params=inference_params,
+            gui=True,
+        )
+
+        # Check that all the models were trained
+        if None in trained_job_paths.values():
+            return -1
+
+        trained_job_paths = list(trained_job_paths.values())
+
+    inference_task = InferenceTask(
+        labels=labels,
+        labels_filename=labels_filename,
+        trained_job_paths=trained_job_paths,
+        inference_params=inference_params,
+    )
+
+    # Run the Predictor for suggested frames
+    new_labeled_frame_count = run_gui_inference(inference_task, items_for_inference)
+
+    return new_labeled_frame_count
+
+
+def run_gui_training(
+    labels_filename: str,
+    labels: Labels,
+    config_info_list: List[ConfigFileInfo],
+    inference_params: Dict[str, Any],
+    gui: bool = True,
+) -> Dict[Text, Text]:
+    """
+    Runs training for each training job.
+
+    Args:
+        labels: Labels object from which we'll get training data.
+        config_info_list: List of ConfigFileInfo with configs for training.
+        gui: Whether to show gui windows and process gui events.
+
+    Returns:
+        Dictionary, keys are head name, values are path to trained config.
+    """
+
+    trained_job_paths = dict()
+    zmq_ports = None
+    if gui:
+        from sleap.gui.widgets.monitor import LossViewer
+        from sleap.gui.widgets.imagedir import QtImageDirectoryWidget
+
+        zmq_ports = dict()
+        zmq_ports["controller_port"] = inference_params.get("controller_port", 9000)
+        zmq_ports["publish_port"] = inference_params.get("publish_port", 9001)
+
+        # Get WandB auto-open setting from inference params (GUI-only setting)
+        auto_open_wandb = inference_params.get("gui.wandb_open_in_browser", False)
+
+        # Open training monitor window
+        win = LossViewer(zmq_ports=zmq_ports, auto_open_wandb=auto_open_wandb)
+
+        # Reassign the values in the inference parameters in case the ports were changed
+        inference_params["controller_port"] = win.zmq_ports["controller_port"]
+        inference_params["publish_port"] = win.zmq_ports["publish_port"]
+        win.resize(600, 400)
+        win.show()
+
+    for config_info in config_info_list:
+        if config_info.dont_retrain:
+            if not config_info.has_trained_model:
+                raise ValueError(
+                    "Config is set to not retrain but no trained model found: "
+                    f"{config_info.path}"
+                )
+
+            print(
+                f"Using already trained model for {config_info.head_name}: "
+                f"{config_info.path}"
+            )
+
+            trained_job_paths[config_info.head_name] = config_info.path
+
+        else:
+            job = config_info.config
+            model_type = config_info.head_name
+
+            # We'll pass along the list of paths we actually used for loading
+            # the videos so that we don't have to rely on the paths currently
+            # saved in the labels file for finding videos.
+            video_path_list = [video.filename for video in labels.videos]
+
+            # Update save dir and run name for job we're about to train
+            # so we have access to them here (rather than letting
+            # train_subprocess update them).
+            # training.Trainer.set_run_name(job, labels_filename)
+            # Use user-specified ckpt_dir if provided, otherwise default to "models"
+            user_ckpt_dir = OmegaConf.select(
+                job, "trainer_config.ckpt_dir", default=None
+            )
+            if not user_ckpt_dir:
+                user_ckpt_dir = "models"
+            # Resolve relative paths against the labels file directory
+            if not os.path.isabs(user_ckpt_dir):
+                job.trainer_config.ckpt_dir = os.path.join(
+                    os.path.dirname(labels_filename), user_ckpt_dir
+                )
+            else:
+                job.trainer_config.ckpt_dir = user_ckpt_dir
+            base_run_name = f"{model_type}.n={len(labels.user_labeled_frames)}"
+            run_path = setup_new_run_folder(
+                job,
+                base_run_name=base_run_name,
+            )
+            job.trainer_config.run_name = Path(run_path).name
+            job.trainer_config.ckpt_dir = Path(run_path).parent.as_posix()
+
+            if gui:
+                print("Resetting monitor window.")
+                plateau_patience = job.trainer_config.early_stopping.patience
+                plateau_min_delta = job.trainer_config.early_stopping.min_delta
+                win.reset(
+                    what=str(model_type),
+                    plateau_patience=plateau_patience,
+                    plateau_min_delta=plateau_min_delta,
+                )
+                win.setWindowTitle(f"Training Model - {str(model_type)}")
+                win.set_message("Preparing to run training...")
+                if job.trainer_config.visualize_preds_during_training:
+                    viz_window = QtImageDirectoryWidget.make_training_vizualizer(
+                        (
+                            Path(job.trainer_config.ckpt_dir)
+                            / job.trainer_config.run_name
+                        ).as_posix()
+                    )
+                    viz_window.move(win.x() + win.width() + 20, win.y())
+                    win.on_epoch.connect(viz_window.poll)
+
+            print(f"Start training {str(model_type)}...")
+
+            def waiting():
+                if gui:
+                    QtWidgets.QApplication.instance().processEvents()
+                    if win.canceled:
+                        return "cancel"
+
+            # Run training
+            trained_job_path, ret = train_subprocess(
+                job_config=job,
+                inference_params=inference_params,
+                labels_filename=labels_filename,
+                video_paths=video_path_list,
+                waiting_callback=waiting,
+            )
+
+            if ret == "success":
+                # get the path to the resulting TrainingJob file
+                trained_job_paths[model_type] = trained_job_path
+                print(f"Finished training {str(model_type)}.")
+            elif ret == "canceled":
+                if gui:
+                    win.close()
+                print("Deleting canceled run data:", trained_job_path)
+                shutil.rmtree(trained_job_path, ignore_errors=True)
+                trained_job_paths[model_type] = None
+                break
+            else:
+                if gui:
+                    win.close()
+                    QtWidgets.QMessageBox(
+                        text=f"An error occurred while training {str(model_type)}. "
+                        "Your command line terminal may have more information about "
+                        "the error."
+                    ).exec_()
+                trained_job_paths[model_type] = None
+                break  # Don't continue to next model if this one failed
+
+    if gui:
+        # close training monitor window
+        win.close()
+
+    return trained_job_paths
+
+
+def run_gui_inference(
+    inference_task: InferenceTask,
+    items_for_inference: ItemsForInference,
+    gui: bool = True,
+) -> int:
+    """Run inference on specified frames using models from training_jobs.
+
+    Args:
+        inference_task: Encapsulates information needed for running inference,
+            such as labels dataset and models.
+        items_for_inference: Encapsulates information about the videos (etc.)
+            on which we're running inference.
+        gui: Whether to show gui windows and process gui events.
+
+    Returns:
+        Number of new frames added to labels.
+    """
+    if not gui:
+        # Non-GUI mode: run synchronously with original callback approach
+        return _run_inference_sync(inference_task, items_for_inference)
+
+    # GUI mode: use threaded worker for responsive UI
+    dialog = InferenceProgressDialog()
+    result = {"frame_count": 0, "success": False}
+
+    # Create worker thread
+    worker = InferenceWorker(inference_task, items_for_inference)
+
+    # Connect signals
+    def on_progress(current, total):
+        dialog.setValue(current)
+        dialog.setMaximum(total)
+
+    def on_status(msg):
+        if msg:  # Guard against None
+            dialog.setLabelText(msg)
+
+    def on_log(line):
+        if line:  # Guard against None
+            dialog.appendLog(line)
+
+    def on_finished(success, frame_count, total_frame_count):
+        result["success"] = success
+        result["frame_count"] = frame_count
+        dialog.setFinished(success, frame_count, total_frame_count)
+
+    worker.progressUpdate.connect(on_progress)
+    worker.statusUpdate.connect(on_status)
+    worker.logOutput.connect(on_log)
+    worker.finished.connect(on_finished)
+
+    # Connect cancel button to worker
+    dialog._cancel_button.clicked.connect(worker.cancel)
+
+    # Start worker and show dialog
+    worker.start()
+    dialog.exec_()  # Blocks until user clicks OK or Cancel
+
+    # Wait for worker to finish if still running
+    if worker.isRunning():
+        worker.cancel()
+        worker.wait(5000)  # Wait up to 5 seconds
+
+    return result["frame_count"] if result["success"] else -1
+
+
+def _run_inference_sync(
+    inference_task: InferenceTask,
+    items_for_inference: ItemsForInference,
+) -> int:
+    """Run inference synchronously (non-GUI mode)."""
+    for item_for_inference in items_for_inference.items:
+        predictions_path, ret = inference_task.predict_subprocess(
+            item_for_inference,
+            append_results=True,
+            waiting_callback=None,
+            gui=False,
+        )
+
+        if ret == "canceled":
+            return -1
+        elif ret != "success":
+            return -1
+
+    inference_task.merge_results()
+    return len(inference_task.results)
+
+
+def train_subprocess(
+    job_config: OmegaConf,
+    labels_filename: str,
+    inference_params: Dict[str, Any],
+    video_paths: Optional[List[Text]] = None,
+    waiting_callback: Optional[Callable] = None,
+):
+    """Runs training inside subprocess."""
+    run_path = (
+        Path(job_config.trainer_config.ckpt_dir) / job_config.trainer_config.run_name
+    ).as_posix()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Write a temporary file of the TrainingJob so that we can respect
+        # any changed made to the job attributes after it was loaded.
+        try:
+            from sleap_nn.config.training_job_config import verify_training_cfg
+
+            # convert json to yaml (to sleap-nn config format)
+            cfg_file_name = datetime.now().strftime("%y%m%d_%H%M%S") + "_config"
+            filter_job_config = filter_cfg(deepcopy(job_config))
+            cfg = verify_training_cfg(filter_job_config)
+            cfg.data_config.train_labels_path = [labels_filename]
+
+            cfg.trainer_config.ckpt_dir = Path(run_path).parent.as_posix()
+            cfg.trainer_config.run_name = Path(run_path).name or ""
+            cfg.trainer_config.zmq.controller_port = inference_params["controller_port"]
+            cfg.trainer_config.zmq.publish_port = inference_params["publish_port"]
+
+            OmegaConf.save(cfg, (Path(temp_dir) / f"{cfg_file_name}.yaml").as_posix())
+
+            # Build CLI arguments for training
+            # Use `python -m` invocation instead of entry point script to ensure
+            # __main__.__spec__ is set. This is required for PyTorch Lightning's
+            # DDP multi-GPU training on Windows/macOS where multiprocessing uses
+            # "spawn" and needs to know what module to re-import in child processes.
+            cli_args = [
+                sys.executable,
+                "-m",
+                "sleap.cli",
+                "train",
+                "--config-name",
+                f"{cfg_file_name}",
+                "--config-dir",
+                f"{temp_dir}",
+            ]
+
+            # Run training in a subprocess.
+            print(cli_args)
+            proc = subprocess.Popen(cli_args)
+
+            # Wait till training is done, calling a callback if given.
+            while proc.poll() is None:
+                if waiting_callback is not None:
+                    ret = waiting_callback()
+                    if ret == "cancel":
+                        print("Canceling training...")
+                        kill_process(proc.pid)
+                        print(f"Killed PID: {proc.pid}")
+                        return run_path, "canceled"
+                time.sleep(0.1)
+
+            # Check return code.
+            if proc.returncode == 0:
+                ret = "success"
+            else:
+                ret = proc.returncode
+        except ImportError:
+            show_sleap_nn_installation_message()
+            logger.error(
+                "sleap-nn is not installed. This appears to be a GUI-only installation."
+                "To enable training, please install SLEAP with the 'nn' dependency."
+                "See the installation guide: https://docs.sleap.ai/latest/installation/"
+            )
+            ret = "error"
+
+    print("Run Path:", run_path)
+
+    return run_path, ret

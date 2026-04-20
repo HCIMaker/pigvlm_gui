@@ -1,0 +1,214 @@
+"""Command line utility for converting between various dataset formats.
+
+Reads:
+* SLEAP dataset in .slp
+* SLEAP "analysis" file in .h5 format
+* LEAP dataset in .mat file
+* DeepLabCut dataset in .yaml or .csv file
+* COCO keypoints dataset in .json file
+
+Writes:
+* SLEAP dataset (defaults to .slp if no extension specified)
+* SLEAP "analysis" file (.h5)
+
+You don't need to specify the input format; this will be automatically detected.
+
+If you don't specify an output path, then by default we will convert to a .slp
+dataset file and save it at `<input path>.slp`.
+
+Analysis HDF5:
+
+If you want to export an "analysis" h5 file, use `--format analysis`. If no
+output path is specified, the default is
+`<input path>.<video index>_<video filename>.analysis.h5`.
+
+The analysis HDF5 file has these datasets:
+
+* "track_occupancy"    (shape: tracks * frames)
+* "tracks"             (shape: frames * nodes * 2 * tracks)
+* "track_names"        (shape: tracks)
+* "node_names"         (shape: nodes)
+* "edge_names"         (shape: nodes - 1)
+* "edge_inds"          (shape: nodes - 1)
+* "point_scores"       (shape: frames * nodes * tracks)
+* "instance_scores"    (shape: frames * tracks)
+* "tracking_scores"    (shape: frames * tracks)
+
+Note: the datasets are stored column-major as expected by MATLAB.
+This means that if you're working with the file in Python you may want to
+first transpose the datasets so they matche the shapes described above.
+"""
+
+import argparse
+import re
+import os
+
+from pathlib import PurePath
+
+from sleap_io import Labels, Video, save_file
+
+
+def create_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_path", help="Path to input file.")
+    parser.add_argument(
+        "-o",
+        "--output",
+        dest="outputs",
+        action="append",
+        default=[],
+        help="Path to output file (optional). The analysis format expects an output "
+        "path per video in the project. Otherwise, the default naming convention "
+        "`<slp path>.<video index>_<video filename>.analysis.h5` will be used for "
+        "every video without a specified output path. Multiple outputs can be "
+        "specified, each preceeded by --output.",
+    )
+    parser.add_argument(
+        "--format",
+        default="slp",
+        help="Output format. Default ('slp') is SLEAP dataset; "
+        "'analysis' results in analysis.h5 file; "
+        "'analysis.csv' results in an analysis csv file;"
+        "'h5' or 'json' results in SLEAP dataset "
+        "with specified file format.",
+    )
+    parser.add_argument(
+        "--video", default="", help="Path to video (if needed for conversion)."
+    )
+    return parser
+
+
+def default_analysis_filename(
+    labels: Labels,
+    video: Video,
+    output_path: str,
+    output_prefix: PurePath,
+    format_suffix: str = "h5",
+) -> str:
+    video_idx = labels.videos.index(video)
+    vn = PurePath(video.filename)
+    filename = str(
+        PurePath(
+            output_path,
+            f"{output_prefix}.{video_idx:03}_{vn.stem}.analysis.{format_suffix}",
+        )
+    )
+    return filename
+
+
+def main(args: list = None):
+    """Entrypoint for `sleap-convert` CLI for converting .slp to different formats.
+
+    Args:
+        args: A list of arguments to be passed into sleap-convert.
+    """
+    from sleap.sleap_io_adaptors.lf_labels_utils import (
+        make_video_callback,
+        labels_load_file,
+    )
+
+    parser = create_parser()
+    args = parser.parse_args(args=args)
+
+    video_callback = make_video_callback([os.path.dirname(args.input_path)])
+    try:
+        labels = labels_load_file(
+            args.input_path, format="*", video_search=video_callback
+        )
+    except TypeError:
+        print("Input file isn't SLEAP dataset so attempting other importers...")
+
+        video_path = args.video if args.video else None
+
+        labels = labels_load_file(
+            args.input_path,
+            format="*",
+            video_search=video_callback,
+            video=video_path,
+        )
+    if "analysis" in args.format:
+        vids = []
+        if len(args.video) > 0:  # if a video is specified
+            for v in labels.videos:  # check if it is among the videos in the project
+                if args.video in v.filename:
+                    vids.append(v)
+                    break
+        else:
+            vids = labels.videos  # otherwise all videos are converted
+
+        outnames = [path for path in args.outputs]
+        if len(outnames) < len(vids):
+            # if there are less outnames provided than videos to convert...
+            if "csv" in args.format:
+                out_suffix = "csv"
+            else:
+                out_suffix = "h5"
+            fn = args.input_path
+            fn = re.sub(r"(\.json(\.zip)?|\.h5|\.slp)$", "", fn)
+            fn = PurePath(fn)
+
+            for video in vids[len(outnames) :]:
+                dflt_name = default_analysis_filename(
+                    labels=labels,
+                    video=video,
+                    output_path=str(fn.parent),
+                    output_prefix=str(fn.stem),
+                    format_suffix=out_suffix,
+                )
+                outnames.append(dflt_name)
+
+        if "csv" in args.format:
+            import sleap_io as sio
+
+            for video, output_path in zip(vids, outnames):
+                # Check for labeled frames before exporting
+                labeled_frames = labels.find(video)
+                if not labeled_frames:
+                    print(f"No labeled frames in {video.filename}. Skipping.")
+                    continue
+
+                sio.save_csv(
+                    labels,
+                    output_path,
+                    format="sleap",
+                    video=video,
+                    include_score=True,
+                    include_empty=True,
+                    save_metadata=True,
+                )
+
+        else:
+            import sleap_io as sio
+
+            for video, output_path in zip(vids, outnames):
+                try:
+                    sio.save_analysis_h5(
+                        labels,
+                        output_path,
+                        video=video,
+                        labels_path=args.input_path,
+                        all_frames=True,
+                        preset="matlab",
+                    )
+                except ValueError as e:
+                    if "No labeled frames" in str(e):
+                        print(f"No labeled frames in {video.filename}. Skipping.")
+                    else:
+                        raise
+
+    elif len(args.outputs) > 0:
+        print(f"Output SLEAP dataset: {args.outputs[0]}")
+        save_file(labels, str(args.outputs[0]))
+
+    elif args.format in ("slp", "json"):
+        output_path = f"{args.input_path}.{args.format}"
+        print(f"Output SLEAP dataset: {output_path}")
+        save_file(labels, str(output_path))
+
+    else:
+        print("You didn't specify how to convert the file.")
+        print(args)
+
+
+if __name__ == "__main__":
+    main()
