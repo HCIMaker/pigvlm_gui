@@ -35,6 +35,8 @@ class Shortcuts(object):
         "goto frame",
         "select to frame",
         "add instance",
+        "add instance default",
+        "add instance copy prior",
         "delete instance",
         "delete track",
         "transpose",
@@ -101,10 +103,14 @@ class Shortcuts(object):
                 shortcuts[action] = ""
                 continue
 
-            try:
-                shortcuts[action] = eval(key_string)
-            except Exception:
-                shortcuts[action] = QKeySequence.fromString(key_string)
+            # Always parse as a key sequence string. Upstream previously did
+            # `eval(key_string)` first and fell back to `fromString` on any
+            # exception, but `eval("1")` returns the int 1 (truthy, no
+            # exception) and silently swallows digit-only shortcuts. None of
+            # the stock bindings relied on eval (all yaml values are
+            # non-Python identifiers like `Ctrl+I`, `Right`, `Esc`, etc.) so
+            # dropping it is safe and fixes bare-digit bindings like `1`/`2`.
+            shortcuts[action] = QKeySequence.fromString(key_string)
         return shortcuts
 
     def save(self):

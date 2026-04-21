@@ -99,7 +99,7 @@ from qtpy.QtWidgets import QApplication, QMainWindow, QMessageBox
 
 import sleap
 from sleap.gui.color import ColorManager
-from sleap.gui.commands import CommandContext, UpdateTopic
+from sleap.gui.commands import AddInstance, CommandContext, UpdateTopic
 from sleap.gui.dialogs.metrics import MetricsTableDialog
 from sleap.gui.dialogs.shortcuts import ShortcutDialog
 from sleap.gui.overlays.instance import InstanceOverlay
@@ -564,6 +564,13 @@ class MainWindow(QMainWindow):
             lambda: self.commands.exportCSVFile(all_videos=True),
         )
 
+        add_menu_item(
+            fileMenu,
+            "export_dlc_csv",
+            "Export DLC CSV...",
+            self.commands.exportDLCCSV,
+        )
+
         add_menu_item(fileMenu, "export_nwb", "Export NWB...", self.commands.exportNWB)
 
         fileMenu.addSeparator()
@@ -787,6 +794,44 @@ class MainWindow(QMainWindow):
         labelMenu = self.menuBar().addMenu("Labels")
         add_menu_item(
             labelMenu, "add instance", "Add Instance", new_instance_menu_action
+        )
+        # Fixed-method shortcuts: Ctrl+1 always places a default instance,
+        # Ctrl+2 always copies from the prior frame — independent of the
+        # "Instance Placement Method" submenu selection.
+        add_menu_item(
+            labelMenu,
+            "add instance default",
+            "Add Instance (Default)",
+            lambda: self.commands.newInstance(init_method="best", offset=10),
+        )
+        def add_all_instances_copying_prior_frame():
+            # Upstream `newInstance(init_method="prior_frame")` copies one
+            # instance per call (picks prev_instances[len(current)] — designed
+            # for walking forward in SLEAP's track-assignment UX). For multi-
+            # animal DLC (e.g., sow + 12 piglets), labelers want one keypress
+            # to clone the whole prior-frame roster. Loop until the current
+            # frame has as many instances as the prior frame.
+            current_lf = self.state["labeled_frame"]
+            video = self.state["video"]
+            if current_lf is None or video is None:
+                return
+            prev_idx = AddInstance.get_previous_frame_index(self.commands)
+            if prev_idx is None:
+                return
+            prev_lf = self.labels.find(video, prev_idx, return_new=False)
+            if not prev_lf:
+                return
+            n_to_copy = max(
+                0, len(prev_lf[0].instances) - len(current_lf.instances)
+            )
+            for _ in range(n_to_copy):
+                self.commands.newInstance(init_method="prior_frame")
+
+        add_menu_item(
+            labelMenu,
+            "add instance copy prior",
+            "Add Instance (Copy Prior Frame)",
+            add_all_instances_copying_prior_frame,
         )
 
         add_submenu_choices(
@@ -1103,6 +1148,7 @@ class MainWindow(QMainWindow):
 
         helpMenu.addSeparator()
         helpMenu.addAction("Keyboard Shortcuts", self._show_keyboard_shortcuts_window)
+        helpMenu.addAction("DLC Shortcuts", self._show_dlc_shortcuts_reference)
         add_menu_check_item(helpMenu, "debug mode", "Debug mode")
 
     def process_events_then(self, action: Callable):
@@ -1126,8 +1172,19 @@ class MainWindow(QMainWindow):
         # Create QC dock (hidden by default, shown when user clicks menu item)
         self._create_qc_dock()
 
-        # Bring videos tab forward.
-        self.videos_dock.wgt_layout.parent().parent().raise_()
+        # Bring the appropriate right-side tab forward. For DLC (ImageVideo-backed)
+        # projects surface "DLC Image Frames"; otherwise keep the original Videos
+        # tab frontmost. Re-runs on every labels change so File → Open also picks
+        # the correct tab (at _create_dock_windows time, labels may still be empty).
+        self._raise_default_right_dock()
+        self.state.connect("labels", self._raise_default_right_dock)
+
+    def _raise_default_right_dock(self, *_):
+        """Raise the DLC Image Frames dock for DLC projects, Videos otherwise."""
+        if any(isinstance(v.filename, list) for v in self.labels.videos):
+            self.dlc_frames_dock.raise_()
+        else:
+            self.videos_dock.wgt_layout.parent().parent().raise_()
 
     def _create_qc_dock(self):
         """Create the QC dock widget (hidden by default)."""
@@ -1340,6 +1397,15 @@ class MainWindow(QMainWindow):
 
         if _has_topic([UpdateTopic.project, UpdateTopic.on_frame]):
             self.instances_dock.table.model().items = self.state["labeled_frame"]
+            # Refresh the DLC Image Frames points cell for the current frame.
+            # Goes through on_data_update (not state["labeled_frame"]) because
+            # in-place mutations of an existing LabeledFrame reassign the same
+            # object, and GuiState suppresses callbacks when old_val == new_val.
+            lf = self.state["labeled_frame"]
+            if lf is not None:
+                self.dlc_frames_dock.model.update_row_for_frame(
+                    lf.frame_idx, lf
+                )
 
         if _has_topic([UpdateTopic.suggestions]):
             self.suggestions_dock.table.model().items = self.labels.suggestions
@@ -1826,6 +1892,17 @@ class MainWindow(QMainWindow):
     def _show_keyboard_shortcuts_window(self):
         """Shows gui for viewing/modifying keyboard shortucts."""
         ShortcutDialog().exec_()
+
+    def _show_dlc_shortcuts_reference(self):
+        """Show the non-modal DLC keyboard-shortcut reference card."""
+        from sleap.gui.dialogs.dlc_shortcuts_reference import (
+            DLCShortcutsReferenceDialog,
+        )
+
+        # Hold a reference so Python doesn't GC the non-modal dialog.
+        self._dlc_shortcuts_dialog = DLCShortcutsReferenceDialog(self)
+        self._dlc_shortcuts_dialog.show()
+        self._dlc_shortcuts_dialog.raise_()
 
     def _show_update_checker_dialog(self):
         """Shows the update checker dialog."""

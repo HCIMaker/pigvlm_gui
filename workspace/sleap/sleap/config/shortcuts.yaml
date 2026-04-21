@@ -1,4 +1,6 @@
-add instance: Ctrl+I
+add instance:
+add instance default: '1'
+add instance copy prior: '2'
 add videos: 
 clear selection: Esc
 close: Ctrl+Q
@@ -33,8 +35,8 @@ show edges: Ctrl+Shift+Tab
 show labels: Ctrl+Tab
 show trails: 
 transpose: Ctrl+T
-frame next: Right
-frame prev: Left
+frame next: S
+frame prev: W
 frame next medium step: Ctrl+Right
 frame prev medium step: Ctrl+Left
 frame next large step: Ctrl+Alt+Right

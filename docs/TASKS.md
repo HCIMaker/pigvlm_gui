@@ -162,7 +162,7 @@ project. They are sized to fit single focused sessions and each produces a
 visibly testable change in the GUI. Each builds on T6 (folder loaded via the
 wizard; DLC Image Frames dock already present from the T6 follow-up).
 
-### T6a. Default the right-side dock to "DLC Image Frames" for DLC projects ⬜
+### T6a. Default the right-side dock to "DLC Image Frames" for DLC projects ✅
 - **Depends on:** T6
 - **Do:** In `workspace/sleap/sleap/gui/app.py` replace the unconditional
   `self.videos_dock.wgt_layout.parent().parent().raise_()` at line 1130 with
@@ -180,7 +180,7 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   Frames list; making them click a tab every session adds friction. The
   check is cheap and degrades gracefully for non-DLC projects.
 
-### T6b. Add "points (labeled/total)" progress column to DLC Image Frames ⬜
+### T6b. Add "points (labeled/total)" progress column to DLC Image Frames ✅
 - **Depends on:** T6a
 - **Do:** Extend `DLCFramesTableModel.columns` in
   `workspace/sleap/sleap/gui/dataviews.py:677` from `("frame", "image")` to
@@ -212,7 +212,7 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   - Multi project with 13 individuals × 3 nodes → fresh rows show `0/39`;
     one fully-labeled instance → row shows `3/39`.
 
-### T6c. Add "labeled" (0/1) status column to DLC Image Frames ⬜
+### T6c. Add "labeled" (0/1) status column to DLC Image Frames ✅
 - **Depends on:** T6b
 - **Do:** Extend `DLCFramesTableModel.columns` to `("frame", "image",
   "points", "labeled")`. Value is `1` if the frame has at least the
@@ -238,7 +238,7 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   - Save `.slp` → close → reopen → `labeled` column reflects actual label
     content (no persistence state to carry across sessions).
 
-### T6d. Rebind "Add Instance" to the `L` key ⬜
+### T6d. Rebind "Add Instance" to the `L` key ✅
 - **Depends on:** T6
 - **Do:** In `workspace/sleap/sleap/config/shortcuts.yaml` change line 1
   from `add instance: Ctrl+I` to `add instance: L`. Verify the existing
@@ -263,7 +263,78 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   - Pressing `Ctrl+I` after the rebind no longer triggers the action
     (expected — it's the replacement case).
 
-### T6e. Add a "Keyboard Shortcuts" reference dialog under Help ⬜
+### T6e. Gate "Add Instance" at the per-frame max-instance cap ✅
+- **Depends on:** T6d
+- **Context:** The `points` column from T6b already exposes the budget:
+  `total = len(skeleton.nodes) * max(1, len(labels.tracks))`. For the sow
+  project that's `4 × 1 = 4`; for the multi project `3 × 13 = 39`. Because
+  every SLEAP instance owns exactly `len(skeleton.nodes)` point slots, the
+  only way to exceed that point total is to exceed the expected instance
+  count. The gate is therefore an **instance-count cap**, not a
+  point-count cap — same adaptive numbers, cheaper to check.
+- **Invariant to enforce:**
+  `len(frame.user_instances) ≤ max(1, len(labels.tracks))`.
+  Count only user-placed instances (not prediction-only ones); predictions
+  should not consume the user budget.
+- **Where to patch (single patch point):** in
+  `workspace/sleap/sleap/gui/commands.py:613` `NewInstance.do_action` (the
+  command layer — this covers L from T6d, the Labels → Add Instance menu,
+  **and** the right-click → Add Instance context path, because they all
+  funnel through `commands.newInstance`). Compute `max_instances` from
+  `context.labels.tracks` and the current labeled frame's user-instance
+  count, and bail early when the cap is reached. Do **not** patch
+  `new_instance_menu_action` at `app.py:774` alone — that would leave the
+  right-click path ungated.
+- **Do:**
+  1. At the top of `NewInstance.do_action`, fetch:
+     - `lf = context.state["labeled_frame"]` (may be `None`).
+     - `n_user = sum(1 for inst in lf.instances if not inst.is_predicted)`
+       (or the equivalent `inst.from_predicted is None` check — confirm
+       the `sleap_io` attribute name while implementing).
+     - `max_instances = max(1, len(context.labels.tracks))`.
+  2. If `n_user >= max_instances`, show a status-bar message (reuse
+     `context.app.statusBar().showMessage(msg, timeout_ms=3000)` — see
+     existing uses in `app.py`) and `return` without creating an instance.
+     Suggested message: `"Frame already has the maximum {max_instances}
+     instance(s); cannot add another."`
+  3. No other code paths need changes — the rest of `newInstance` runs
+     unchanged when the gate passes.
+- **Decision to surface (rejection UX):** three options; pick one when
+  implementing and note the choice in `docs/PROGRESS.md`:
+  - **(A, recommended)** Status-bar message + silent no-op. Non-blocking,
+    matches how SLEAP surfaces most user-correctable conditions.
+  - **(B)** `QMessageBox.information` modal. Louder — good for first-time
+    users but interrupts fast labeling workflow.
+  - **(C)** Disable the menu item / shortcut when at cap. Cleanest
+    affordance but requires wiring to `state["labeled_frame"]` changes to
+    re-enable on frame navigation — more code for the same outcome.
+- **Accept:** (Shortcut is `1` = Add Instance (Default), per T6d final state
+  — `L` was rebound away during that task.)
+  - Sow project on any frame → press `1` once → 1 instance created → press
+    `1` again → no 2nd instance; status bar shows the cap message; the
+    `points` column row stays at `0/4` (or whatever the current labeled
+    count was). Placing all 4 nodes does not change the gate.
+  - Multi project on any frame → press `1` thirteen times → 13 instances
+    created (one per track) → 14th `1` → rejected with status-bar message;
+    `points` row denominator reads `/39`.
+  - Multi project, subsequent frames where the bulk-copy helper
+    (`2` = Add Instance (Copy Prior Frame)) is used → helper internally
+    calls `commands.newInstance` in a loop; the gate must not fire
+    spuriously during that loop as long as the prior frame had ≤13 user
+    instances. A 14th iteration (shouldn't happen given 13 tracks, but
+    worth asserting) is rejected by the same guard.
+  - Right-click → Add Instance on a capped frame → same rejection
+    behavior (confirms the command-layer gate covers all entry points).
+  - Prediction-only frames do not eat the user budget: a frame with 13
+    prediction instances and 0 user instances still accepts `1` up to 13
+    user instances.
+- **Why the command-layer gate matters:** putting the check in
+  `new_instance_menu_action` would leave right-click, future hotkeys, and
+  any programmatic `commands.newInstance(...)` callers ungated. One guard
+  at the command boundary is both simpler and safer against regressions
+  when new entry points are added.
+
+### T6f. Add a "Keyboard Shortcuts" reference dialog under Help ✅
 - **Depends on:** T6d
 - **Do:** Add a new menu item under the Help menu (or under File if Help
   doesn't exist yet in the fork — check `app.py:_create_menus` around line
@@ -271,16 +342,18 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   `showShortcutsDialog` that opens a non-modal `QDialog` with a read-only
   two-column `QTableWidget` (Key → Action). Populate the table by reading
   `workspace/sleap/sleap/config/shortcuts.yaml` at dialog-open time and
-  filtering to a curated DLC subset (at minimum: `L → Add instance`,
-  `Right/Left → Frame next/prev`, `Ctrl+S → Save`, `Esc → Clear
-  selection`). Keep ~5–10 rows — this is a quick reference, not a full
-  cheatsheet.
+  filtering to a curated DLC subset reflecting T6d's final bindings (at
+  minimum: `1 → Add Instance (Default)`, `2 → Add Instance (Copy Prior
+  Frame)`, `W/S → Frame prev/next`, `A/D → optional left/right nav if
+  wired`, `Ctrl+S → Save`, `Esc → Clear selection`). Keep ~5–10 rows —
+  this is a quick reference, not a full cheatsheet.
 - **Why yaml-backed:** source of truth stays in one file
-  (`shortcuts.yaml`). If T6d's binding ever changes, the dialog follows
+  (`shortcuts.yaml`). If T6d's bindings ever change, the dialog follows
   automatically.
 - **Accept:**
   - Help → Keyboard Shortcuts → dialog opens with a two-column table.
-  - The `L → Add instance` row is present and correct.
+  - Rows for `1 → Add Instance (Default)` and `2 → Add Instance (Copy
+    Prior Frame)` are present and correct.
   - Close button dismisses; reopening shows current yaml contents (any
     edits made since last launch appear).
 
@@ -290,10 +363,11 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
 - **Depends on:** T4, T6
 - **Do:** Create `workspace/sleap/sleap/io/format/dlc_csv.py` with a
   `DLCCSVAdaptor` class (mirror the shape of `csv.py`'s `CSVAdaptor`). Port
-  the single-animal 3-row-header logic from `../sleap_to_dlc.py`. Output
+  the single-animal 3-row-header logic from `../sleap_to_dlc_multi.py`. Output
   name: `CollectedData_<scorer>.csv` in the image folder. Unlabeled
   keypoints → empty cells (see `docs/MUST_KNOW.md §3A`). Wire it into the
-  File menu next to existing "Export Analysis CSV..." (`app.py:538`).
+  File menu next to existing "Export Analysis CSV..." (`app.py:538`). Look at structure, for example,
+  C:\Jiale\pigvlm_gui\pigvlm_gui\PigFarm_Sow-jiale-2026-02-08\labeled-data
 - **Accept:** Export on the sow project → diff the CSV against
   `PigFarm_Sow-jiale-2026-02-08/labeled-data/<folder>/CollectedData_jiale.csv`.
   Header rows identical, column order identical, occluded-keypoint cells
@@ -310,12 +384,12 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   Occluded keypoints not drawn.
 
 ### T9. End-to-end smoke test — single-animal ⬜
-- **Depends on:** T7, T8, T6e
+- **Depends on:** T7, T8, T6f
 - **Do:** Full flow on `sleap_label/single/ch07_Crate08_..._00h15m00s/`:
   File → New DLC Project → sow config → folder → confirm DLC Image Frames
   dock is the frontmost tab (T6a) → for ≥5 frames: navigate to frame,
-  press `L` to add instance (T6d), place all 4 keypoints, watch row flip
-  to `4/4` + `labeled=1` in the panel (T6b/T6c) → Export → DLC CSV →
+  press `1` to add a default instance (T6d), place all 4 keypoints, watch
+  row flip to `4/4` + `labeled=1` in the panel (T6b/T6c) → Export → DLC CSV →
   Render labeled previews → upload CSV to server → run
   `python 2_create_project/csv_to_h5_official.py` and
   `python 2_create_project/check_labels_from_sleap.py`.
@@ -336,11 +410,13 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   `PigFarm_Multi-jiale-2026-02-08/labeled-data/<folder>/CollectedData_jiale.csv`.
 
 ### T11. End-to-end smoke test — multi-animal ⬜
-- **Depends on:** T10, T6e
+- **Depends on:** T10, T6f
 - **Do:** Full flow on `sleap_label/mutli/ch07_Crate08_..._00h35m00s/`:
   wizard with multi config → folder → confirm DLC Image Frames dock is
-  frontmost (T6a) → for ≥5 frames: press `L` twice to add two instances
-  (T6d), assign each to a distinct individual via the Tracks panel, place
+  frontmost (T6a) → for the first labeled frame, press `1` twice to add
+  two default instances (T6d); for subsequent frames press `2` once to
+  bulk-copy all instances from the prior frame (T6d follow-up) → assign
+  each to a distinct individual via the Tracks panel as needed, place
   keypoints, watch the `points` and `labeled` columns update (T6b/T6c) →
   Export → DLC CSV → Render previews → upload → server scripts.
 - **Accept:** Both server commands exit 0 on the multi project. Per-row

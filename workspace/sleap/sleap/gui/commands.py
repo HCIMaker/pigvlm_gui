@@ -320,6 +320,10 @@ class CommandContext:
         """Stamp today's ISO date into `labels.provenance['date']`."""
         self.execute(MarkFolderFinished)
 
+    def exportDLCCSV(self):
+        """Export a DLC CollectedData_<scorer>.csv for the current DLC project."""
+        self.execute(ExportDLCCSV)
+
     def loadLabelsObject(self, labels: Labels, filename: Optional[str] = None):
         """Loads a `Labels` object into the GUI, replacing any currently loaded.
 
@@ -1035,6 +1039,60 @@ class MarkFolderFinished(AppCommand):
         context.labels.provenance["date"] = datetime.now().isoformat(
             timespec="minutes"
         )
+
+
+class ExportDLCCSV(AppCommand):
+    """Write `CollectedData_<scorer>.csv` into the DLC project's image folder.
+
+    Scorer comes from `labels.provenance["labeler"]` (set by the T5 yaml
+    picker). Output folder comes from `labels.provenance["image_folder"]`.
+    Both are required — if either is missing the command aborts with a
+    status-bar message (matches the T6e rejection-UX convention).
+    """
+
+    @staticmethod
+    def do_action(context: CommandContext, params: dict):
+        from pathlib import Path
+
+        from sleap.io.format.dlc_csv import DLCCSVAdaptor
+
+        labels = context.labels
+        scorer = labels.provenance.get("labeler")
+        image_folder = labels.provenance.get("image_folder")
+
+        def _status(msg: str):
+            status_bar = getattr(context.app, "statusBar", None)
+            if callable(status_bar):
+                status_bar().showMessage(msg, 5000)
+            else:
+                print(msg)
+
+        if not scorer or not image_folder:
+            _status(
+                "Export DLC CSV: project is missing provenance `labeler` or "
+                "`image_folder` — open via File → New DLC Project first."
+            )
+            return
+
+        folder = Path(image_folder)
+        if not folder.is_dir():
+            _status(f"Export DLC CSV: image folder not found on disk: {folder}")
+            return
+
+        video = context.state["video"] or (labels.videos[0] if labels.videos else None)
+        if video is None:
+            _status("Export DLC CSV: no video in project.")
+            return
+
+        out_path = folder / f"CollectedData_{scorer}.csv"
+        DLCCSVAdaptor.write(
+            filename=str(out_path),
+            source_object=labels,
+            video=video,
+            scorer=scorer,
+            folder_name=folder.name,
+        )
+        _status(f"Exported DLC CSV: {out_path}")
 
 
 class LoadLabelsObject(AppCommand):
@@ -4288,6 +4346,19 @@ class AddInstance(EditCommand):
         if len(context.state["skeleton"]) == 0:
             return
 
+        lf = context.state["labeled_frame"]
+        # Single-animal projects have 0 tracks; cap stays at 1.
+        max_instances = max(1, len(context.labels.tracks))
+        if len(lf.user_instances) >= max_instances:
+            status_bar = getattr(context.app, "statusBar", None)
+            if callable(status_bar):
+                status_bar().showMessage(
+                    f"Frame already has the maximum {max_instances} "
+                    f"instance(s); cannot add another.",
+                    3000,
+                )
+            return
+
         (
             copy_instance,
             from_predicted,
@@ -4648,9 +4719,12 @@ class SetInstancePointLocations(EditCommand):
 class SetInstancePointVisibility(EditCommand):
     """Toggles visibility set for a node for an instance.
 
-    Note: It's important that this command does *not* update the visual
-    scene, since this would redraw the frame and create new visual objects.
-    The calling code is responsible for updating the visual scene.
+    Note: It's important that this command does *not* redraw the visual
+    scene (which would tear down and recreate QGraphicsItems). The
+    calling code is responsible for updating the visual scene locally.
+    We fire `UpdateTopic.on_frame` — that refreshes data panels (DLC
+    Image Frames points column, Instances dock) without invoking
+    `plotFrame`, preserving the no-scene-redraw invariant.
 
     Params:
         instance: The instance
@@ -4658,7 +4732,7 @@ class SetInstancePointVisibility(EditCommand):
         visible: Whether to set or clear visibility for node
     """
 
-    topics = []
+    topics = [UpdateTopic.on_frame]
 
     @classmethod
     def do_action(cls, context: "CommandContext", params: dict):

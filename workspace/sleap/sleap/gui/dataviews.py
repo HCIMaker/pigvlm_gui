@@ -524,7 +524,13 @@ class SuggestionsTableModel(GenericTableModel):
         item_dict["SuggestionFrame"] = item
 
         video_idx = labels.videos.index(item.video) + 1
-        video_name = os.path.basename(item.video.filename)
+        fn = item.video.filename
+        if isinstance(fn, list):
+            # ImageVideo (DLC folder-of-frames): use the parent folder name
+            # since the "video" is conceptually the folder, not a single frame.
+            video_name = os.path.basename(os.path.dirname(fn[0])) if fn else "(empty)"
+        else:
+            video_name = os.path.basename(fn)
         video_string = f"{video_idx}: {video_name}"
 
         item_dict["group"] = "0"
@@ -674,6 +680,46 @@ class SkeletonNodeModel(QtCore.QStringListModel):
         return QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
 
 
+# T6c: a frame counts as "labeled" once the user has placed at least this many
+# visible keypoints. Matches the spec wording "have >1 body points labeled"
+# (>1 → ≥2). "Walked through" is implied by "has labeled points" since placing
+# a keypoint requires navigating to the frame first.
+DLC_LABELED_THRESHOLD = 2
+
+
+def _dlc_denominator_parts(labels):
+    """Return (n_nodes, n_expected_instances) for the DLC points column.
+
+    Denominator policy (a) from TASKS.md T6b: fixed labeling budget per frame —
+    `len(skeleton.nodes) * max(1, len(labels.tracks))`. Single-animal projects
+    have zero tracks, so `n_expected` falls back to 1.
+    """
+    if labels is None or not labels.skeletons:
+        return 0, 1
+    n_nodes = len(labels.skeletons[0].nodes)
+    n_expected = max(1, len(labels.tracks))
+    return n_nodes, n_expected
+
+
+def _count_labeled_points(labeled_frame) -> int:
+    """Return the count of labeled keypoints on a frame for the DLC progress column.
+
+    Drives the "labeled" numerator in the DLC Image Frames `points` column.
+
+    Semantics (MUST_KNOW.md §4): a keypoint only ends up in the exported DLC
+    CSV if it is *visible* (occluded/un-placed keypoints become empty cells).
+    PredictedInstance points are model output, not human labeling, so they
+    should not count toward labeling progress.
+
+    Counts user-placed, visible keypoints: skip `PredictedInstance` (model
+    output, not labels) and skip points the human flagged occluded.
+    """
+    total = 0
+    for instance in labeled_frame.user_instances:
+        total += instance.n_visible
+    return total
+
+
 class DLCFramesTableModel(GenericTableModel):
     """One row per image file in an ImageVideo-backed video.
 
@@ -682,13 +728,54 @@ class DLCFramesTableModel(GenericTableModel):
     MediaVideo/HDF5Video backends, the table is empty — non-applicable.
     """
 
-    properties = ("frame", "image")
+    properties = ("frame", "image", "points", "labeled")
 
     def object_to_items(self, video):
         fn = getattr(video, "filename", None)
         if not isinstance(fn, list):
             return []
-        return [
-            {"frame": i + 1, "image": Path(f).name, "_frame_idx": i, "_video": video}
-            for i, f in enumerate(fn)
-        ]
+
+        labels = self.context.labels if self.context is not None else None
+        n_nodes, n_expected = _dlc_denominator_parts(labels)
+        total = n_nodes * n_expected
+
+        items = []
+        for i, f in enumerate(fn):
+            labeled = 0
+            if labels is not None:
+                lfs = labels.find(video=video, frame_idx=i, return_new=False)
+                if lfs:
+                    labeled = _count_labeled_points(lfs[0])
+            items.append(
+                {
+                    "frame": i + 1,
+                    "image": Path(f).name,
+                    "points": f"{labeled}/{total}",
+                    "labeled": 1 if labeled >= DLC_LABELED_THRESHOLD else 0,
+                    "_frame_idx": i,
+                    "_video": video,
+                }
+            )
+        return items
+
+    def update_row_for_frame(self, frame_idx: int, labeled_frame) -> None:
+        """Recompute the derived cells (`points`, `labeled`) for a single row.
+
+        Called from `on_data_update` when a user command mutates the current
+        frame. Updates only the affected row so scroll position and row
+        selection are preserved. Emits one `dataChanged` spanning both
+        derived columns to avoid redundant repaints.
+        """
+        if not (0 <= frame_idx < len(self._data)):
+            return
+        labels = self.context.labels if self.context is not None else None
+        n_nodes, n_expected = _dlc_denominator_parts(labels)
+        total = n_nodes * n_expected
+        labeled = _count_labeled_points(labeled_frame) if labeled_frame is not None else 0
+        self._data[frame_idx]["points"] = f"{labeled}/{total}"
+        self._data[frame_idx]["labeled"] = 1 if labeled >= DLC_LABELED_THRESHOLD else 0
+        points_col = self.properties.index("points")
+        labeled_col = self.properties.index("labeled")
+        top_left = self.index(frame_idx, points_col)
+        bottom_right = self.index(frame_idx, labeled_col)
+        self.dataChanged.emit(top_left, bottom_right)
