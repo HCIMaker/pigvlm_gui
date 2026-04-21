@@ -78,6 +78,10 @@ class DLCCSVAdaptor(adaptor.Adaptor):
             scorer: Scorer name (also used in header). Required.
             folder_name: The DLC folder name used in the CSV's combined-path
                 index (i.e. ``labeled-data/<folder_name>/<img>``). Required.
+
+        Returns:
+            ``True`` if a CSV was written, ``False`` if no labeled frames
+            were found (nothing to export).
         """
         if scorer is None or folder_name is None:
             raise ValueError("DLCCSVAdaptor.write requires scorer and folder_name.")
@@ -109,8 +113,7 @@ class DLCCSVAdaptor(adaptor.Adaptor):
             rows[rel_path] = row_data
 
         if not rows:
-            print(f"No labeled frames in video. Skipping DLC CSV export: {filename}")
-            return
+            return False
 
         df = pd.DataFrame.from_dict(rows, orient="index")
         df.columns = pd.MultiIndex.from_tuples(
@@ -125,3 +128,4 @@ class DLCCSVAdaptor(adaptor.Adaptor):
         df = df.reindex(columns=full_cols)
         df = df.sort_index()
         df.to_csv(filename)
+        return True

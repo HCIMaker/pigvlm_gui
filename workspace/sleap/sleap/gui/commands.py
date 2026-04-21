@@ -1085,14 +1085,43 @@ class ExportDLCCSV(AppCommand):
             return
 
         out_path = folder / f"CollectedData_{scorer}.csv"
-        DLCCSVAdaptor.write(
+
+        has_user_labels = any(
+            any(not inst.from_predicted for inst in lf.instances)
+            for lf in labels.find(video)
+        )
+        if not has_user_labels:
+            _status(
+                f"Export DLC CSV: no labeled frames in video — nothing to "
+                f"write to {out_path}."
+            )
+            return
+
+        if out_path.exists():
+            reply = QtWidgets.QMessageBox.question(
+                context.app,
+                "Overwrite DLC CSV?",
+                f"{out_path.name} already exists in\n{folder}\n\nOverwrite?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                _status(f"Export DLC CSV: canceled (file exists): {out_path}")
+                return
+
+        wrote = DLCCSVAdaptor.write(
             filename=str(out_path),
             source_object=labels,
             video=video,
             scorer=scorer,
             folder_name=folder.name,
         )
-        _status(f"Exported DLC CSV: {out_path}")
+        if wrote:
+            _status(f"Exported DLC CSV: {out_path}")
+        else:
+            _status(
+                f"Export DLC CSV: no labeled frames in video — nothing to "
+                f"write to {out_path}."
+            )
 
 
 class LoadLabelsObject(AppCommand):

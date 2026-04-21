@@ -956,20 +956,40 @@ config.
     for left_ear AND setting torso coords to NaN with visible=False both
     produced empty cells in the output row; other keypoints retained
     full precision.
+- **Post-acceptance tweaks (2026-04-21, user-requested after manual test):**
+  1. **Empty-project bug:** when no user labels existed, the adaptor
+     returned early with a `print()` but the command still showed
+     "Exported DLC CSV: ..." in the status bar. Root cause: adaptor
+     returned `None` implicitly on the empty-rows early return and the
+     command didn't check — so the success message fired either way.
+     Fix: adaptor now returns `bool` (`True` if CSV written, `False` if
+     skipped). Command inspects the return and switches the status-bar
+     message accordingly. Also moved the "any user labels?" peek
+     *before* the overwrite prompt so an empty project with an existing
+     CSV no longer triggers a pointless overwrite dialog.
+  2. **Overwrite confirmation:** user wanted an explicit confirmation
+     before clobbering an existing `CollectedData_<scorer>.csv`. Added
+     a `QMessageBox.question` Yes/No prompt in `ExportDLCCSV.do_action`
+     when the output path already exists. No → status bar "Export DLC
+     CSV: canceled (file exists): ..."; Yes → proceed to write.
 - **Pending manual verification (interactive GUI):**
   1. Launch `uv run sleap-label` → File → New DLC Project → complete the
      wizard with the sow `config.yaml` and an existing DLC folder →
      label ≥1 frame (press `1`, place keypoints) → File → "Export DLC
-     CSV..." → status bar reads
+     CSV..." → (no existing file) → status bar reads
      "Exported DLC CSV: <image_folder>/CollectedData_jiale.csv" (5s).
-  2. Open the exported CSV in a text editor → header rows
+  2. Repeat File → "Export DLC CSV..." on the same project → overwrite
+     confirmation dialog opens → Yes → status bar "Exported DLC CSV:
+     ..."; run again → No → status bar "Export DLC CSV: canceled
+     (file exists): ..." and the on-disk file is unchanged (verify via
+     mtime).
+  3. Open the exported CSV in a text editor → header rows
      (`scorer,jiale,...` / `bodyparts,...` / `coords,x,y,...`) match the
      reference; data row(s) present for every labeled frame.
-  3. Mark a keypoint as occluded (right-click → Mark Occluded) → re-export
-     → that keypoint's x,y cells are empty; others unchanged.
-  4. Export with no labeled frames → status bar reports "No labeled
-     frames in video. Skipping DLC CSV export: ..." (from the adaptor's
-     early return) and no CSV is written.
-  5. Open a non-DLC project (mp4-backed `.slp`) → File → "Export DLC
-     CSV..." → status bar reads "Export DLC CSV: project is missing
-     provenance `labeler` or `image_folder`..." and no CSV is written.
+  4. Mark a keypoint as occluded (right-click → Mark Occluded) → re-export
+     (confirm overwrite) → that keypoint's x,y cells are empty; others
+     unchanged.
+  5. Export with no labeled frames → status bar reports "Export DLC
+     CSV: no labeled frames in video — nothing to write to ..." and no
+     CSV is written (no overwrite prompt either, even if a previous
+     CSV exists on disk).

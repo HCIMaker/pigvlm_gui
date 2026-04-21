@@ -364,7 +364,13 @@ class MainWindow(QMainWindow):
 
         self._create_color_manager()
         self._create_video_player()
-        self.statusBar()
+        status_bar = self.statusBar()
+        status_font = status_bar.font()
+        status_font.setPointSize(13)
+        status_font.setBold(True)
+        status_bar.setFont(status_font)
+        status_bar.setSizeGripEnabled(False)
+        status_bar.setContentsMargins(8, 4, 8, 4)
 
         self._create_menus()
         self._create_dock_windows()
