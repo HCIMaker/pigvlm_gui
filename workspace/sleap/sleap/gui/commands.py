@@ -987,6 +987,10 @@ class NewDLCProject(AppCommand):
     @staticmethod
     def do_action(context: CommandContext, params: dict):
         wizard = QtWidgets.QWizard(context.app)
+        # ClassicStyle drops Qt's hardcoded white "paper sheet" so the page
+        # text follows the system palette — readable on dark-mode Windows
+        # 11, macOS, and Linux without per-OS theming.
+        wizard.setWizardStyle(QtWidgets.QWizard.ClassicStyle)
         wizard.setWindowTitle("New DLC Project")
 
         wizard.addPage(_DLCYamlPage())
