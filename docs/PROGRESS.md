@@ -689,6 +689,96 @@ config.
   (13 undos to reverse one bulk copy). Consistent with SLEAP's
   delete-one-at-a-time UX. Promote to a single command if this
   becomes a pain point.
+
+### T6d follow-up 3 — preserve occluded keypoints across "copy prior frame" (2026-04-21)
+
+- **Symptom (user-reported):** on a multi-animal project, marking a
+  keypoint occluded (right-click → toggle visibility) on the prior
+  frame, then pressing `2` to bulk-copy onto the next frame, caused
+  that occluded keypoint to appear at a *random location* on the new
+  instance instead of preserving its prior coordinates with
+  `visible=False`.
+- **Root cause:** `AddInstance.set_visible_nodes`
+  (`commands.py:4577-4641`) decided whether the source had a copyable
+  value via `np.isnan(copy_instance.numpy()[node_idx])`, but
+  `Instance.numpy()` masks every `visible=False` point as NaN
+  regardless of stored xy. Occluded points (numeric xy +
+  `visible=False`) therefore failed the check, fell through to
+  `fill_missing_nodes`, which for `init_method="prior_frame"`
+  dispatches to the `else` branch at line 4518 → `add_best_nodes` →
+  `add_random_nodes` as a fallback, planting random coordinates.
+- **Why "unplaced vs occluded" matters:** sleap_io's `Instance.empty`
+  initializes every point with `xy=[0, 0]` and `visible=False` — the
+  *unplaced* sentinel. An occluded point also has `visible=False`
+  but with the user's last-placed xy. The point dtype has no
+  separate "placed" flag (only `xy`, `visible`, `complete`, `name`),
+  so we have to disambiguate by xy.
+- **Fix (`workspace/sleap/sleap/gui/commands.py:4577-4641`):**
+  rewrote the per-node loop in `set_visible_nodes`. Instead of
+  routing missing-or-occluded through one NaN check, the loop now
+  inspects the stored point directly:
+  - Source skeleton missing the node → `has_missing_nodes = True`,
+    skip to next iteration (unchanged semantics).
+  - Stored xy contains NaN → same.
+  - Stored `visible=False` AND xy exactly `[0, 0]` → unplaced
+    sentinel; `has_missing_nodes = True`, skip.
+  - Anything else (visible-and-placed OR occluded-with-stored-xy) →
+    copy xy and visibility through to the new instance. The
+    existing bounds-check / scale / offset logic is unchanged
+    (just dedented one level since the early-skip replaced the
+    outer `if`/`else`).
+  - Result: occluded points round-trip with `visible=False` and
+    their original xy.
+- **Bug 2 hypothesis ruled out:** the user also asked whether
+  `n_to_copy = len(prev.instances) - len(curr.instances)` (in the
+  bulk helper at `app.py:817`) might *fabricate* the missing
+  instances when prior has fewer than `len(labels.tracks)`.
+  Verified empirically: prev=10, curr=0, multi project with 13
+  tracks → `n_to_copy=10`, loop copies exactly 10, three "missing
+  individuals" remain unlabeled. No fabrication.
+- **Why this fix is safe across other init methods:** the same
+  `set_visible_nodes` is used by `init_method="best"` (with or
+  without click location), `"prediction"`, `"prior_frame"`, etc.
+  The new check is strictly more permissive (occluded points now
+  copy through whereas they used to be re-randomized). The
+  alternative — gating per init_method — would have meant
+  duplicating logic. Single change point.
+- **Headless smoke tests (QT_QPA_PLATFORM=offscreen):** all PASS.
+  Source instance with: visible-placed left_ear at (100,200),
+  occluded right_ear at (300,400), visible-placed torso at
+  (500,600), unplaced hip at default. After `set_visible_nodes`
+  copies onto an empty destination:
+  - left_ear: xy=(100,200), visible=True → OK.
+  - right_ear: xy=(300,400), visible=False → **OK (was the bug)**.
+  - torso: xy=(500,600), visible=True → OK.
+  - hip: dst untouched (xy=(0,0), visible=False),
+    `has_missing_nodes=True` returned → `fill_missing_nodes`
+    handles it as before.
+  - Pre-flight printed `src.numpy()` = `[[100,200],[nan,nan],
+    [500,600],[nan,nan]]`, confirming `numpy()` would have masked
+    *both* right_ear (occluded) and hip (unplaced); the new check
+    distinguishes them via stored xy.
+  - T6e cap-gate regression: still blocks at cap (13 user
+    instances, 13 tracks → 14th call short-circuits before
+    `find_instance_to_copy_from`). No interaction with this fix.
+- **Pending manual verification:**
+  1. Multi-animal project, prior frame: place all 39 keypoints
+     across 13 instances. Mark one keypoint on one instance
+     occluded (right-click → Toggle Visibility, point disappears
+     visually but stays in the data).
+  2. Move to the next empty frame, press `2`. Inspect the
+     instance whose keypoint was occluded: that node should be
+     in the same screen position as on the prior frame and
+     marked invisible (rendered as occluded — usually grey/X
+     marker depending on theme), NOT at a random position.
+  3. Sow project regression: occlude a keypoint on a labeled
+     frame, copy via prior-frame helper to the next frame, same
+     occlusion preservation behavior.
+  4. Sow project: leave one of the 4 keypoints unplaced on the
+     prior frame, press `2` on the next frame. The 3 placed
+     keypoints copy through; the unplaced one is filled by
+     `fill_missing_nodes` (template/random) — same behavior as
+     before this fix.
 - **Headless smoke tests (QT_QPA_PLATFORM=offscreen):** all PASS.
   - `_count_labeled_points` — empty frame → 0, 2 visible of 4 → 2,
     3 placed with 1 flagged occluded → 3 (matches the "occluded = not
@@ -882,8 +972,8 @@ config.
 
 ## T7. DLC CSV export — single-animal
 
-- **Status:** 🔵 implementation complete, awaiting user acceptance via
-  manual GUI test (2026-04-21).
+- **Status:** ✅ done — 2026-04-23 (user accepted after the overwrite-prompt
+  and empty-project fixes, plus the status-bar-visibility follow-up below).
 - **Occluded/unplaced semantics chosen (from T7 options surfaced pre-code):**
   option (A) — both `visible=False` and NaN coordinates collapse to empty
   CSV cells. Matches the T6b/T6c numerator (if a point is not counted in
@@ -993,3 +1083,153 @@ config.
      CSV: no labeled frames in video — nothing to write to ..." and no
      CSV is written (no overwrite prompt either, even if a previous
      CSV exists on disk).
+
+### T7 follow-up — status-bar visibility (2026-04-23)
+
+- **Symptom:** after accepting the new DLC CSV export messages (e.g.
+  "Exported DLC CSV: ..."), the user noted the default Qt status bar
+  at the bottom was too small to read comfortably during labeling.
+- **Change (`workspace/sleap/sleap/gui/app.py:367`):** replaced the
+  bare `self.statusBar()` call in `_initialize_gui` with a small setup
+  block that bumps the status bar's font to 13pt bold (default on
+  Windows was ~9pt regular), adds `(8, 4, 8, 4)` content margins so
+  the bar grows a bit beyond the font's natural height, and disables
+  the bottom-right size grip (the diagonal-lines corner grabber that
+  looks out of place at the larger size).
+- **Why `setFont` rather than `setStyleSheet`:** the existing error
+  toggle at `app.py:1558` calls
+  `self.statusBar().setStyleSheet("color: red")` and then clears it
+  with `setStyleSheet("")`. If the font had been set via stylesheet,
+  the red toggle would wipe it. `setFont` is a separate Qt property
+  from stylesheets, so the red toggle continues to flip only the
+  color while the 13pt-bold font persists across both states.
+  Verified with an offscreen Qt smoke test: `setFont` pointSize and
+  weight survive `setStyleSheet("color: red")` and `setStyleSheet("")`
+  round-trips.
+- **Global vs. DLC-scoped:** the change affects *every* SLEAP status
+  message (save notifications, the per-frame `img<NNN>.png` filename
+  from the T6 follow-up, the "Hidden instances" red warning at
+  `app.py:1555-1558`, etc.), not only DLC export ones. Surfaced
+  that trade-off before implementing; user confirmed global was the
+  right choice for visual consistency.
+- **Tuning knob for future tweaks:** `app.py:369`
+  (`status_font.setPointSize(13)`). If a labeler with a high-DPI
+  display finds 13pt too chunky, or someone on a small laptop wants
+  bigger, that's the single value to edit.
+
+## T9. End-to-end smoke test — single-animal
+
+- **Status:** ✅ done — 2026-04-27 (user-verified end-to-end on
+  `sleap_label/single/ch07_Crate08_..._00h15m00s/`).
+- **Verified flow:** File → New DLC Project → sow `config.yaml` →
+  image folder → DLC Image Frames dock came up frontmost (T6a) →
+  ≥5 frames labeled with `1`-shortcut + 4 keypoints each, with the
+  `points` column flipping to `4/4` and `labeled` column flipping to
+  `1` per row (T6b/T6c) → File → Export DLC CSV → CSV uploaded to
+  the Linux server → `python 2_create_project/csv_to_h5_official.py`
+  and `python 2_create_project/check_labels_from_sleap.py` both
+  exited 0.
+- **No code changes.** T9 is a verification-only task; every piece
+  of behavior it exercises was implemented by T3–T7. This entry
+  records that the integration of those pieces holds up under the
+  full single-animal pipeline through DLC's server-side checks.
+- **Open follow-up (none for T9):** T10 (extending `DLCCSVAdaptor`
+  with the 4-row multi-animal header) was the next task and is now
+  ✅ done; T11 (multi-animal smoke test) is the only remaining task.
+
+## T10. DLC CSV export — multi-animal
+
+- **Status:** ✅ done — 2026-04-27 (headless diff vs reference passes;
+  pending interactive GUI verification rolls into T11).
+- **Mapping decision (user call, 2026-04-27):** trackless / order-based.
+  Labelers do **not** identify instances; the Nth user instance on a
+  frame is written under the Nth yaml `individual`. Columns are
+  anonymous slots — there is no "label sow first, piglet1 next" rule.
+  Pre-implementation discussion considered (A) silent skip of untracked
+  instances, (B) skip+warn, (C) refuse, (D) position-fallback; the
+  user collapsed all four by picking "no identification at all", which
+  removes `inst.track` from the export path entirely and simplifies the
+  adaptor (no track lookups, no warning UI). The cost is on the
+  semantic side: DLC's per-individual columns are now treated as
+  un-attributed slots, fine for keypoint-detection training without ID.
+- **Why the existing `Track` infrastructure is still useful:**
+  `len(labels.tracks)` is what T6e uses to cap per-frame instances at
+  the right number (13 for the multi project), and the adaptor uses
+  `[t.name for t in labels.tracks]` only to recover the column-name
+  order from the yaml — never `inst.track`. T5's wizard remains the
+  single source of truth for both individuals list and column order.
+- **Changes (single file):**
+  - `workspace/sleap/sleap/io/format/dlc_csv.py`
+    - Updated module docstring to cover both modes (single + multi)
+      and to record the trackless decision.
+    - `write()` now branches on `is_multi = bool([t.name for t in source_object.tracks])`.
+      Single-animal path (T7) is **byte-identical** to before.
+    - Multi-animal path: iterates `lf.user_instances` in their natural
+      order; instance index N is mapped to `individuals[N]` purely
+      positionally; `break` if `inst_idx >= len(individuals)` (defensive,
+      T6e cap should already prevent overflow).
+    - 4-level `MultiIndex.from_product([[scorer], individuals, bodyparts, ["x","y"]])`
+      column order is enforced by `df.reindex` so the CSV's column
+      order tracks the yaml regardless of dict insertion order.
+    - Sub-pixel float precision: `Instance.numpy()` returns `float64`
+      and we pass through `float(x)` — no precision loss inside the
+      adaptor itself (see "Float-precision finding" below).
+- **No GUI/command-layer changes:** the existing `ExportDLCCSV` command
+  (T7) calls `DLCCSVAdaptor.write` with the same signature for both
+  modes. Empty-project guard, overwrite confirmation, and status-bar
+  reporting all carry over unchanged.
+- **Headless diff verification (`scratch/verify_t10_multi_export.py`):**
+  Built a synthetic `Labels` from the reference multi-animal CSV
+  (13 tracks, 3 nodes, 20 LabeledFrames; one instance per individual
+  per frame in canonical column order, all-NaN coords for absent
+  individuals to preserve positional alignment), exported via the
+  adaptor, then compared:
+  - **First 4 header rows byte-identical** (`scorer/individuals/bodyparts/coords`).
+  - **Index column byte-identical** (20 `labeled-data/<folder>/img<NNN>.png` rows).
+  - **Column ordering byte-identical** (78-tuple
+    `(scorer, individual, bodypart, axis)` MultiIndex).
+  - **368/368 NaN-empty cells in identical positions** (matches the
+    "individual not present on frame" pattern from MUST_KNOW §4 — the
+    reference CSV has piglets absent on most frames).
+  - **1192/1192 finite cells match within `rtol=1e-12`**, max actual
+    relative diff = `1.22e-16` (= 1 ULP of float64). Well below
+    float32 precision (DLC's training dtype).
+- **Float-precision finding (worth a memory entry if it bites again):**
+  Initial byte/exact-float diff flagged 1/1192 cells (sometimes 90/1192
+  via `float_precision='round_trip'`). Investigation showed this is
+  a pandas-side artifact, not an adaptor bug:
+  1. The reference CSV was written by an older pandas/numpy that
+     emitted 17-digit float text (e.g. `232.85714285714295`).
+     Modern `pd.DataFrame.to_csv()` emits the *shortest*
+     round-trippable form (e.g. `232.85714285714292` for the same
+     `float64`) — different text, same `float64` after round-trip.
+  2. pandas's C parser for **multi-header** CSVs (`header=[0,1,2,3]`)
+     loses 1 ULP on certain 17-digit inputs. Verified: the literal
+     `232.85714285714295` parsed via `pd.read_csv(header=[0,1,2,3])`
+     yields `0x1.d1b6db6db6db9p+7`, while `float()` on the same
+     string yields `0x1.d1b6db6db6dbap+7` (1 ULP higher). DLC's
+     `csv_to_h5_official.py` uses the same lossy default parser, so
+     this drift is *invisible* downstream — both files parse to the
+     same DLC-visible value.
+  3. Conclusion: the adaptor preserves bits perfectly; the
+     reference-vs-output drift comes from pandas-version differences
+     and is below DLC training's float32 floor. T7's milder version
+     of this finding logged here for completeness.
+- **Pending manual verification (rolls into T11):**
+  1. Launch `uv run sleap-label` → File → New DLC Project → multi
+     `config.yaml` → image folder → DLC Image Frames dock frontmost.
+  2. Press `1` thirteen times on first frame, place keypoints on each
+     instance in any order; T6e accepts up to 13, blocks the 14th.
+     `points` column reads `N/39` and increments per visible point.
+  3. File → "Export DLC CSV..." → status bar reads
+     "Exported DLC CSV: <image_folder>/CollectedData_jiale.csv".
+     Open the CSV → 4-row header (`scorer/individuals/bodyparts/coords`),
+     78 data columns ordered by yaml individuals × bodyparts × (x,y).
+  4. Subsequent frame → press `2` once → all 13 instances bulk-copied
+     (T6d follow-up 2). Adjust keypoints, re-export, confirm overwrite,
+     CSV row appears with all 13 individuals' coords.
+  5. Skip an individual (only 5 of 13 placed on a frame, intentionally)
+     → re-export → row has the first 5 individuals filled, last 8
+     individuals' columns empty. (Note: the *which* 5 is determined by
+     instance add-order on that frame, not by spatial identity — per
+     the trackless decision.)

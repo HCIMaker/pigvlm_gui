@@ -11,6 +11,7 @@ modify files under `sleap-develop/` itself — it is the read-only reference.
 - ✅ Done (tested & approved)
 - 🔵 Current
 - ⬜ Pending
+- ⏭️ Skipped (intentionally dropped — see task body for rationale)
 
 ## Phase 1 — Workspace Setup
 
@@ -359,7 +360,7 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
 
 ## Phase 3 — Single-Animal Full Pipeline
 
-### T7. DLC CSV export — single-animal 🔵
+### T7. DLC CSV export — single-animal ✅
 - **Depends on:** T4, T6
 - **Do:** Create `workspace/sleap/sleap/io/format/dlc_csv.py` with a
   `DLCCSVAdaptor` class (mirror the shape of `csv.py`'s `CSVAdaptor`). Port
@@ -373,52 +374,67 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   Header rows identical, column order identical, occluded-keypoint cells
   truly empty, scorer row shows our labeler name.
 
-### T8. Batch-render labeled previews to disk ⬜
-- **Depends on:** T6
-- **Do:** Add "View → Render labeled previews" action. For each labeled
-  frame, call `sleap_io.render_image` (already used by
-  `sleap/gui/widgets/rendering_preview.py:19`) and save the rendered PNG to
-  `<image_folder>/labeled_preview/`.
-- **Accept:** Run on a folder where 5 frames have been labeled → 5 PNGs in
-  `labeled_preview/` with keypoints (colored dots) and skeleton edges drawn.
-  Occluded keypoints not drawn.
+### T8. Batch-render labeled previews to disk ⏭️
+- **Decision (2026-04-23):** skipped. Static preview PNGs were intended for
+  pre-upload QA and out-of-GUI sharing, but the workflow doesn't actually
+  need them:
+  1. **In-GUI rendering is automatic on `.slp` reopen.** SLEAP's
+     `QtInstance` overlays at `sleap/gui/widgets/video.py:497` redraw
+     every label on every frame nav — visualization is free, just open
+     the project. (Verified during the T7 follow-up discussion.)
+  2. **Server already validates labels post-upload.** Per
+     `docs/MUST_KNOW.md §9`, `check_labels_from_sleap.py` re-renders the
+     uploaded CSV server-side. Client-side preview PNGs would duplicate
+     that step.
+  3. **Sharing/audit-trail use cases haven't come up** in this project —
+     can revisit if they ever do; `sleap_io.render_image` is still
+     available as the building block.
 
-### T9. End-to-end smoke test — single-animal ⬜
-- **Depends on:** T7, T8, T6f
+### T9. End-to-end smoke test — single-animal ✅
+- **Depends on:** T7, T6f
 - **Do:** Full flow on `sleap_label/single/ch07_Crate08_..._00h15m00s/`:
   File → New DLC Project → sow config → folder → confirm DLC Image Frames
   dock is the frontmost tab (T6a) → for ≥5 frames: navigate to frame,
   press `1` to add a default instance (T6d), place all 4 keypoints, watch
-  row flip to `4/4` + `labeled=1` in the panel (T6b/T6c) → Export → DLC CSV →
-  Render labeled previews → upload CSV to server → run
+  row flip to `4/4` + `labeled=1` in the panel (T6b/T6c) → Export → DLC CSV
+  → upload CSV to server → run
   `python 2_create_project/csv_to_h5_official.py` and
   `python 2_create_project/check_labels_from_sleap.py`.
-- **Accept:** Both server commands exit 0. Previews exist and match the
-  labels. DLC Image Frames panel shows the labeled 5 rows at `4/4` and
-  `labeled=1`; unlabeled rows stay at `0/4`/`0`. `docs/PROGRESS.md`
-  captures the command outputs.
+- **Accept:** Both server commands exit 0. DLC Image Frames panel shows
+  the labeled 5 rows at `4/4` and `labeled=1`; unlabeled rows stay at
+  `0/4`/`0`. `docs/PROGRESS.md` captures the command outputs. (Visual
+  label-correctness is verified by the server's `check_labels_from_sleap.py`,
+  not by client-side preview PNGs — see T8 for why.)
 
 ## Phase 4 — Multi-Animal Add-On
 
-### T10. DLC CSV export — multi-animal ⬜
+### T10. DLC CSV export — multi-animal ✅
 - **Depends on:** T7, T9
 - **Do:** Extend `DLCCSVAdaptor` with the 4-row header (`scorer / individuals
   / bodyparts / coords`). Column order: `individuals × bodyparts × (x,y)`
   (NOT SLEAP's per-instance grouping — see `docs/MUST_KNOW.md §3B`). Port
   logic from `../sleap_to_dlc_multi.py`.
+- **Mapping decision (2026-04-27 user call):** trackless / order-based —
+  the Nth user instance on a frame is written under the Nth yaml
+  `individual`. Labelers do NOT identify instances; columns are anonymous
+  slots. T6e caps per-frame instance count at `len(individuals)`, so
+  overflow can't occur; frames with fewer instances leave trailing
+  individuals' columns empty (= MUST_KNOW §4 "individual not present").
 - **Accept:** Export on multi project. Diff against
   `PigFarm_Multi-jiale-2026-02-08/labeled-data/<folder>/CollectedData_jiale.csv`.
 
-### T11. End-to-end smoke test — multi-animal ⬜
+### T11. End-to-end smoke test — multi-animal ✅
 - **Depends on:** T10, T6f
 - **Do:** Full flow on `sleap_label/mutli/ch07_Crate08_..._00h35m00s/`:
   wizard with multi config → folder → confirm DLC Image Frames dock is
-  frontmost (T6a) → for the first labeled frame, press `1` twice to add
-  two default instances (T6d); for subsequent frames press `2` once to
-  bulk-copy all instances from the prior frame (T6d follow-up) → assign
-  each to a distinct individual via the Tracks panel as needed, place
-  keypoints, watch the `points` and `labeled` columns update (T6b/T6c) →
-  Export → DLC CSV → Render previews → upload → server scripts.
+  frontmost (T6a) → for the first labeled frame, press `1` thirteen times
+  to add 13 default instances (T6d) and place keypoints on each (in any
+  order — instance N maps to `individuals[N]` positionally per T10's
+  trackless-mapping decision); for subsequent frames press `2` once to
+  bulk-copy all 13 instances from the prior frame (T6d follow-up), then
+  adjust keypoints. Watch the `points` and `labeled` columns update
+  (T6b/T6c) → Export → DLC CSV → upload → server scripts.
 - **Accept:** Both server commands exit 0 on the multi project. Per-row
   `points` denominator matches `nodes × len(tracks)` from the yaml; rows
-  with ≥2 labeled points read `labeled=1`.
+  with ≥2 labeled points read `labeled=1`. (Preview-PNG step removed —
+  see T8 for rationale.)

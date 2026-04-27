@@ -1,19 +1,29 @@
 """Adaptor for exporting SLEAP labels as a DeepLabCut CollectedData CSV.
 
-Single-animal projects only (T7). Multi-animal is T10.
+Single-animal: 3-row header (T7). Multi-animal: 4-row header (T10).
+Mode is detected from `len(labels.tracks)` (T5 attaches one `Track` per
+yaml `individuals` entry for multi; tracks list is empty for single).
 
-Output matches the single-level-index + 3-level-MultiIndex-column shape that
-`pandas.DataFrame.to_csv()` produces — i.e., the shape of the reference
+Output matches the single-level-index + N-level-MultiIndex-column shape
+that `pandas.DataFrame.to_csv()` produces — the shape of the reference
 `CollectedData_<scorer>.csv` files under
-``PigFarm_Sow-jiale-2026-02-08/labeled-data/<folder>/``. See
-`docs/MUST_KNOW.md` §3A for the format spec (with the caveat, noted in
-`docs/PROGRESS.md` under T7, that the diagram's 3-cell leading offset does
-not match the real CSV — the real CSV uses a single combined-path index
-column).
+``PigFarm_{Sow,Multi}-jiale-2026-02-08/labeled-data/<folder>/``. See
+`docs/MUST_KNOW.md` §3A/§3B for the format spec (with the caveat, noted
+in `docs/PROGRESS.md` under T7, that the diagram's 3-cell leading offset
+does not match the real CSV — the real CSV uses a single combined-path
+index column).
 
 Occluded and unplaced keypoints both land as empty CSV cells (option A —
 matches the T6b/T6c numerator semantics: if a point is not counted toward
 `labeled/total`, it is not written to the CSV either).
+
+Multi-animal mapping is **trackless / order-based** (per 2026-04-27 user
+decision): the Nth user instance on a frame is written under the Nth
+yaml `individual`. Labelers do not identify instances; columns are
+treated as anonymous slots. Frames with fewer than `len(individuals)`
+instances leave the trailing individuals' columns empty (= "not present"
+per MUST_KNOW §4). T6e caps the per-frame instance count at
+`len(individuals)`, so overflow cannot occur in practice.
 """
 
 from pathlib import Path
@@ -66,7 +76,11 @@ class DLCCSVAdaptor(adaptor.Adaptor):
         scorer: str = None,
         folder_name: str = None,
     ):
-        """Write single-animal DLC CollectedData CSV.
+        """Write a DLC CollectedData CSV (single- or multi-animal).
+
+        Mode is inferred from ``len(source_object.tracks)``: empty → single
+        (3-row header); non-empty → multi (4-row header, trackless
+        order-based individual mapping — see module docstring).
 
         Args:
             filename: Absolute path to the output CSV (e.g.
@@ -93,38 +107,61 @@ class DLCCSVAdaptor(adaptor.Adaptor):
 
         skeleton = source_object.skeletons[0]
         bodyparts = [node.name for node in skeleton.nodes]
+        individuals = [t.name for t in source_object.tracks]
+        is_multi = bool(individuals)
 
         rows: dict[str, dict[tuple, float]] = {}
         for lf in source_object.find(video):
             user_instances = [i for i in lf.instances if not i.from_predicted]
             if not user_instances:
                 continue
-            inst = user_instances[0]
-            coords = inst.numpy()  # (n_nodes, 2), NaN for invisible/unplaced
 
             img_name = Path(video.filename[lf.frame_idx]).name
             rel_path = f"labeled-data/{folder_name}/{img_name}"
 
             row_data: dict[tuple, float] = {}
-            for i, bp in enumerate(bodyparts):
-                x, y = coords[i]
-                row_data[(scorer, bp, "x")] = float(x)
-                row_data[(scorer, bp, "y")] = float(y)
+            if is_multi:
+                # Trackless order-based mapping: nth user instance →
+                # individuals[n]. T6e caps at len(individuals) so the
+                # break is defensive only.
+                for inst_idx, inst in enumerate(user_instances):
+                    if inst_idx >= len(individuals):
+                        break
+                    ind_name = individuals[inst_idx]
+                    coords = inst.numpy()  # (n_nodes, 2), NaN for invisible
+                    for i, bp in enumerate(bodyparts):
+                        x, y = coords[i]
+                        row_data[(scorer, ind_name, bp, "x")] = float(x)
+                        row_data[(scorer, ind_name, bp, "y")] = float(y)
+            else:
+                inst = user_instances[0]
+                coords = inst.numpy()  # (n_nodes, 2), NaN for invisible
+                for i, bp in enumerate(bodyparts):
+                    x, y = coords[i]
+                    row_data[(scorer, bp, "x")] = float(x)
+                    row_data[(scorer, bp, "y")] = float(y)
             rows[rel_path] = row_data
 
         if not rows:
             return False
 
+        if is_multi:
+            col_names = ["scorer", "individuals", "bodyparts", "coords"]
+            full_cols = pd.MultiIndex.from_product(
+                [[scorer], individuals, bodyparts, ["x", "y"]],
+                names=col_names,
+            )
+        else:
+            col_names = ["scorer", "bodyparts", "coords"]
+            full_cols = pd.MultiIndex.from_product(
+                [[scorer], bodyparts, ["x", "y"]],
+                names=col_names,
+            )
+
         df = pd.DataFrame.from_dict(rows, orient="index")
-        df.columns = pd.MultiIndex.from_tuples(
-            df.columns, names=["scorer", "bodyparts", "coords"]
-        )
-        # Guarantee bodypart column order matches the skeleton (and thus
-        # config.yaml), regardless of insertion order of the row dicts.
-        full_cols = pd.MultiIndex.from_product(
-            [[scorer], bodyparts, ["x", "y"]],
-            names=["scorer", "bodyparts", "coords"],
-        )
+        df.columns = pd.MultiIndex.from_tuples(df.columns, names=col_names)
+        # Guarantee column order matches yaml-derived (individuals ×) bodyparts,
+        # regardless of insertion order of the row dicts.
         df = df.reindex(columns=full_cols)
         df = df.sort_index()
         df.to_csv(filename)

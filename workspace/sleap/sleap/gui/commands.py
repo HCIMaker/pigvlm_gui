@@ -816,8 +816,8 @@ class _DLCYamlPage(QtWidgets.QWizardPage):
 
     `validatePage()` runs on Next — parse errors block advance and are shown
     in the status label. Successful parse writes `wizard._skeleton`,
-    `wizard._tracks`, `wizard._scorer`, and `wizard._config_yaml` so
-    `_DLCMetadataPage.initializePage()` can display the scorer read-only.
+    `wizard._tracks`, `wizard._scorer`, and `wizard._config_yaml` so the
+    image-folder page can seed its Browse dialog at `<config_dir>/labeled-data`.
     """
 
     def __init__(self):
@@ -867,38 +867,6 @@ class _DLCYamlPage(QtWidgets.QWizardPage):
         w._scorer = scorer
         w._config_yaml = self._path_edit.text()
         return True
-
-
-class _DLCMetadataPage(QtWidgets.QWizardPage):
-    """Dataset name (required) + read-only labeler display.
-
-    The labeler string is the `scorer` field from the yaml picked on the
-    previous wizard page (T5). This page reads it from `wizard._scorer`;
-    if T5 hasn't set it, a placeholder is shown.
-    """
-
-    def __init__(self):
-        super().__init__()
-        self.setTitle("Project metadata")
-
-        self.dataset_edit = QtWidgets.QLineEdit()
-        self.dataset_edit.setPlaceholderText("e.g. PigFarm_Sow")
-        self.dataset_edit.textChanged.connect(self.completeChanged)
-
-        self.labeler_label = QtWidgets.QLabel("<set by config.yaml>")
-
-        form = QtWidgets.QFormLayout(self)
-        form.addRow("Dataset name:", self.dataset_edit)
-        form.addRow("Labeler (scorer):", self.labeler_label)
-
-    def initializePage(self):
-        scorer = getattr(self.wizard(), "_scorer", None)
-        if scorer:
-            self.labeler_label.setText(scorer)
-
-    def isComplete(self) -> bool:
-        # Gates the Finish button: non-empty after trimming whitespace.
-        return bool(self.dataset_edit.text().strip())
 
 
 def _validate_dlc_folder(folder_path: str) -> None:
@@ -963,8 +931,17 @@ class _DLCFolderPage(QtWidgets.QWizardPage):
         layout.addWidget(self._status)
 
     def _browse(self):
+        # Default to <config.yaml dir>/labeled-data when present — that's
+        # where DLC always keeps per-clip image folders.
+        config_yaml = getattr(self.wizard(), "_config_yaml", "")
+        start_dir = ""
+        if config_yaml:
+            project_root = Path(config_yaml).parent
+            labeled_data = project_root / "labeled-data"
+            start_dir = str(labeled_data if labeled_data.is_dir() else project_root)
+
         path = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Select image folder"
+            self, "Select image folder", start_dir
         )
         if path:
             self._path_edit.setText(path)
@@ -994,8 +971,6 @@ class NewDLCProject(AppCommand):
         wizard.setWindowTitle("New DLC Project")
 
         wizard.addPage(_DLCYamlPage())
-        metadata_page = _DLCMetadataPage()
-        wizard.addPage(metadata_page)
         wizard.addPage(_DLCFolderPage())
 
         if wizard.exec_() != QtWidgets.QDialog.Accepted:
@@ -1008,7 +983,7 @@ class NewDLCProject(AppCommand):
         video = Video.from_filename(wizard._image_folder)
         labels.add_video(video)
         labels.provenance["mode"] = "dlc"
-        labels.provenance["dataset"] = metadata_page.dataset_edit.text().strip()
+        labels.provenance["dataset"] = Path(wizard._image_folder).name
         labels.provenance["labeler"] = wizard._scorer
         labels.provenance["config_yaml"] = wizard._config_yaml
         labels.provenance["image_folder"] = wizard._image_folder
@@ -4576,55 +4551,67 @@ class AddInstance(EditCommand):
 
         # Go through each node in skeleton.
         for node in context.state["skeleton"].node_names:
-            # If we're copying from a skeleton that has this node.
             node_idx = context.state["skeleton"].node_names.index(node)
-            if node in copy_instance.skeleton.node_names and not np.any(
-                np.isnan(copy_instance.numpy()[node_idx])
-            ):
-                # Ensure x, y inside current frame, then copy x, y, and visible.
-                # We don't want to copy a PredictedPoint or score attribute.
-                point_data = copy_instance[node_idx]
-                x_old, y_old = point_data["xy"]
-
-                # Copy the instance without scale or offset if predicted
-                if isinstance(copy_instance, PredictedInstance):
-                    x_new = x_old
-                    y_new = y_old
-                else:
-                    x_new = x_old * scale_width
-                    y_new = y_old * scale_height
-
-                # Apply offset if in bounds
-                x_new_offset = x_new + offset_x
-                y_new_offset = y_new + offset_y
-
-                # Default visibility is same as copied instance.
-                visible = point_data["visible"]
-
-                # If the node is offset to outside the frame, mark as not visible.
-                if x_new_offset < 0:
-                    x_new = 0
-                    visible = False
-                elif x_new_offset > new_size_width:
-                    x_new = new_size_width
-                    visible = False
-                else:
-                    x_new = x_new_offset
-                if y_new_offset < 0:
-                    y_new = 0
-                    visible = False
-                elif y_new_offset > new_size_height:
-                    y_new = new_size_height
-                    visible = False
-                else:
-                    y_new = y_new_offset
-
-                new_instance[node]["xy"] = np.array([x_new, y_new])
-                new_instance[node]["visible"] = visible
-                new_instance[node]["complete"] = mark_complete
-                new_instance[node]["name"] = node
-            else:
+            if node not in copy_instance.skeleton.node_names:
                 has_missing_nodes = True
+                continue
+            point_data = copy_instance[node_idx]
+            xy_old_raw = point_data["xy"]
+            # `Instance.numpy()` masks any visible=False point as NaN, which
+            # conflates "never placed" with "placed then occluded". Use the
+            # stored xy directly and detect sleap_io's unplaced sentinel
+            # (visible=False with xy==[0,0]) so occluded points retain their
+            # coordinates and visibility on copy.
+            is_unplaced = (
+                not bool(point_data["visible"])
+                and float(xy_old_raw[0]) == 0.0
+                and float(xy_old_raw[1]) == 0.0
+            )
+            if np.any(np.isnan(xy_old_raw)) or is_unplaced:
+                has_missing_nodes = True
+                continue
+
+            # Ensure x, y inside current frame, then copy x, y, and visible.
+            # We don't want to copy a PredictedPoint or score attribute.
+            x_old, y_old = xy_old_raw
+
+            # Copy the instance without scale or offset if predicted
+            if isinstance(copy_instance, PredictedInstance):
+                x_new = x_old
+                y_new = y_old
+            else:
+                x_new = x_old * scale_width
+                y_new = y_old * scale_height
+
+            # Apply offset if in bounds
+            x_new_offset = x_new + offset_x
+            y_new_offset = y_new + offset_y
+
+            # Default visibility is same as copied instance.
+            visible = point_data["visible"]
+
+            # If the node is offset to outside the frame, mark as not visible.
+            if x_new_offset < 0:
+                x_new = 0
+                visible = False
+            elif x_new_offset > new_size_width:
+                x_new = new_size_width
+                visible = False
+            else:
+                x_new = x_new_offset
+            if y_new_offset < 0:
+                y_new = 0
+                visible = False
+            elif y_new_offset > new_size_height:
+                y_new = new_size_height
+                visible = False
+            else:
+                y_new = y_new_offset
+
+            new_instance[node]["xy"] = np.array([x_new, y_new])
+            new_instance[node]["visible"] = visible
+            new_instance[node]["complete"] = mark_complete
+            new_instance[node]["name"] = node
 
         return has_missing_nodes
 
