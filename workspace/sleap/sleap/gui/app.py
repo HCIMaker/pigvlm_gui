@@ -541,6 +541,12 @@ class MainWindow(QMainWindow):
             "Mark folder finished labeling",
             self.commands.markFolderFinished,
         )
+        add_menu_item(
+            fileMenu,
+            "sync_dlc_image_folder",
+            "Sync DLC image folder",
+            self.commands.syncDLCImageFolder,
+        )
 
         export_analysis_menu = fileMenu.addMenu("Export Analysis HDF5...")
         add_menu_item(

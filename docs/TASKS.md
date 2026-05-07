@@ -438,3 +438,122 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
   `points` denominator matches `nodes × len(tracks)` from the yaml; rows
   with ≥2 labeled points read `labeled=1`. (Preview-PNG step removed —
   see T8 for rationale.)
+
+## Phase 5 — Maintenance
+
+### T12. Sync DLC image folder (append-only, on-demand) 🔵
+- **Depends on:** T6
+- **Background:** When the wizard finishes, `Video.from_filename(folder)`
+  expands the folder to a frozen `list[str]` of paths and stores it in the
+  `.slp` as `backend["filenames"]` (sleap_io `io/slp.py:359`). On reopen,
+  the loader reads that list back verbatim — no re-globbing. So images
+  added to `labeled-data/<folder>/` *after* the project was saved are
+  invisible to the open project: they don't appear in DLC Image Frames,
+  can't be navigated to, and won't be exported. This task adds an
+  on-demand action to pull new files in without disturbing existing labels.
+- **Pre-decided facts (from 2026-05-07 session with user):**
+  1. **Append-only, dedupe by basename.** Use sleap_io's
+     `Video.merge_with` (`model/video.py:735`) which keeps existing files
+     in their current positions and appends only basenames not already in
+     the list. This preserves `frame_idx` for every existing label —
+     critical, because labels are keyed by integer index, and a sorted
+     re-scan that inserts a new file in the middle would silently shift
+     every label onto the wrong image.
+  2. **On-demand menu item, not auto-sync on open.** Predictable behavior;
+     the project on disk doesn't go dirty without the user asking for it.
+  3. **Folder source = `labels.provenance["image_folder"]`** (set by the
+     wizard at `commands.py:989`). If the key is missing (legacy `.slp`
+     made before that field existed) or the folder no longer exists on
+     disk, abort with a status-bar message — same UX convention as T6e
+     and `ExportDLCCSV`.
+  4. **No CSV change.** The exporter (`dlc_csv.py`) already iterates
+     `video.filename` for its row order, so newly-appended frames
+     automatically show up in the next CSV export with empty cells until
+     they get labeled. Nothing in T7/T10 needs to change.
+- **Do:**
+  1. Add a new `AppCommand` `SyncDLCImageFolder` in
+     `workspace/sleap/sleap/gui/commands.py` (place it next to
+     `MarkFolderFinished` so the DLC-related commands stay grouped).
+     `does_edits = True` so the project goes dirty when files are added.
+  2. In `do_action`:
+     - Read `image_folder` from `labels.provenance`. If missing or not a
+       directory on disk → status-bar message, return. Reuse the same
+       `_status` helper pattern from `ExportDLCCSV.do_action`
+       (`commands.py:1042`).
+     - Resolve the existing video: `video = labels.videos[0]` if the
+       project has exactly one video; if there's no video or multiple
+       videos, status-bar message and abort (DLC projects always have one
+       ImageVideo per the wizard).
+     - Sanity-check `isinstance(video.filename, list)` — if it's not, the
+       project isn't ImageVideo-backed and this command doesn't apply.
+     - Build a fresh `Video.from_filename(image_folder)` to get the
+       current on-disk list. Call `merged = video.merge_with(new_video)`.
+     - If `len(merged.filename) == len(video.filename)` → no new files;
+       status-bar message "Sync DLC image folder: no new images found in
+       <folder>" and return without marking dirty.
+     - Otherwise, replace the project's video. Use
+       `context.commands.execute(ReplaceVideo, ...)` if a `ReplaceVideo`
+       command already exists (check `commands.py` for `replaceVideo` /
+       `class ReplaceVideo` first); otherwise do the replacement in-place
+       via `labels.videos[0] = merged` and update the labeled-frames'
+       video reference (each `LabeledFrame.video` must point at the new
+       `Video` object — iterate `labels.labeled_frames` and reassign).
+       Picking which path to use is a judgment call once you've checked
+       what's in `commands.py` — record the choice in `docs/PROGRESS.md`.
+     - Refresh the DLC Image Frames dock so the new rows appear. The
+       cleanest path is to re-emit on whatever signal `DLCFramesDock`
+       already listens to for full-table refresh; if no such signal
+       exists, call the dock's table model `update(video)` method
+       directly. Locate the dock via `context.app.dlc_frames_dock`.
+     - Status-bar message: `"Sync DLC image folder: added N new image(s)
+       (was M, now M+N)"`.
+  3. Wire it into the File menu in `workspace/sleap/sleap/gui/app.py`.
+     Place it directly after the "Mark folder finished labeling" menu
+     item so all DLC-specific actions are co-located. Label:
+     `"Sync DLC image folder"`. No keyboard shortcut for now (the action
+     is rare; adding it would consume a single-key binding for little
+     gain).
+  4. Add a new `Commands` method `syncDLCImageFolder` that calls
+     `self.execute(SyncDLCImageFolder)`, mirroring how `markFolderFinished`
+     and `newDLCProject` are wired (see `commands.py:317`).
+- **Accept:**
+  - **Sow project, no new files:** open an existing DLC `.slp` whose
+     folder hasn't changed → File → Sync DLC image folder → status bar
+     reads "no new images found"; project stays clean (Save action is
+     not pulsing/highlighted).
+  - **Sow project, files added:** drop 3 new `imgNNN.png` files into the
+     folder → reopen the `.slp` → DLC Image Frames dock shows the
+     original row count → File → Sync DLC image folder → dock now shows
+     `original + 3` rows; the new rows appear at the **bottom** with
+     `points = 0/4` and `labeled = 0`; existing rows are unchanged
+     (frame number, image name, points, labeled all match pre-sync) →
+     Save → close → reopen → row count and ordering match the post-sync
+     state.
+  - **Existing labels survive:** before sync, label frame index 5 with
+     all 4 keypoints (`4/4`, `labeled = 1`) → run sync → frame index 5
+     still reads `4/4`, `labeled = 1`, and the same image filename is
+     shown in the `image` column.
+  - **Multi project:** same flow on the multi project; new rows show
+     `points = 0/39` (nodes × tracks per T6b's denominator).
+  - **Missing provenance key:** open a non-DLC `.slp` (or one made
+     before `image_folder` was added to provenance) → File → Sync DLC
+     image folder → status-bar message naming the missing field;
+     nothing else changes.
+  - **Folder gone:** rename the folder on disk → reopen the `.slp` →
+     File → Sync DLC image folder → status-bar message "image folder
+     not found on disk: <path>"; project stays clean.
+  - **Re-export sanity:** after a successful sync, Export DLC CSV → the
+     CSV's image column lists the original images followed by the new
+     ones in append order; new rows have empty x/y cells.
+- **Why these shapes matter:**
+  - `merge_with` is the only safe primitive here. A naive "rebuild from
+    a sorted directory listing" would re-sort the list and shift every
+    label index — silent data corruption that would only surface when
+    the server-side checker runs. The append-only contract is what makes
+    this command non-destructive.
+  - Putting the action in the File menu (not under a hidden refresh
+    button on the dock) matches where labelers already look for
+    project-level actions like Save and Mark folder finished. Keeping it
+    on-demand means an unchanged folder produces zero side effects on
+    open — important for the workflow where users open a project just to
+    review CSV output before upload.

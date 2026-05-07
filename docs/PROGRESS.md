@@ -1233,3 +1233,69 @@ config.
      individuals' columns empty. (Note: the *which* 5 is determined by
      instance add-order on that frame, not by spatial identity — per
      the trackless decision.)
+
+## T12. Sync DLC image folder (append-only, on-demand)
+
+- **Status:** 🔵 implemented + unit-verified, awaits manual GUI smoke test.
+- **What it does:** appends new image files (by basename) from
+  `labels.provenance["image_folder"]` to the project's frozen image list
+  using `Video.replace_filename(merged_paths, open=True)`. Existing labels
+  stay valid because `frame_idx` keys against the unchanged prefix of the
+  list — new files only land at the end.
+- **Why this command exists:** the wizard freezes the folder's image list
+  into the `.slp` at finish time (sleap_io `io/slp.py:359`), and the loader
+  reads it back verbatim with no re-glob (`io/slp.py:215-219`). So images
+  added to a labeled-data folder *after* save are invisible until the
+  project is rebuilt. T12 is the on-demand pull-in for that case.
+- **Files touched (3 lines of net change in app.py, ~85 lines added in
+  commands.py):**
+  - `workspace/sleap/sleap/gui/commands.py` — new `SyncDLCImageFolder`
+    AppCommand (between `MarkFolderFinished` and `ExportDLCCSV`); new
+    `Commands.syncDLCImageFolder` wrapper alongside `markFolderFinished`.
+  - `workspace/sleap/sleap/gui/app.py` — new "Sync DLC image folder"
+    File-menu item placed directly after "Mark folder finished labeling"
+    (DLC actions stay grouped).
+- **Design choices:**
+  - **Append-only via `replace_filename` mutation, not via re-glob + replace.**
+    A naive sorted re-glob would push every label one row down if a new
+    file inserts in the middle of the sorted order — silent data
+    corruption that surfaces only at server-side check time. Appending
+    keeps every existing `(video, frame_idx)` mapping intact.
+  - **`does_edits = False`, manual `changestack_push` only when files
+    actually change.** Acceptance criterion required that running sync on
+    an unchanged folder leaves the project clean. The auto-push in
+    `do_with_signal` is unconditional, so the command is registered as
+    non-edit and pushes itself only when the merged list grows.
+  - **Explicit `state.emit("video")` after the in-place mutation.** The
+    DLCFramesDock listens via `state.connect("video", ...)`, which fires on
+    *value-change*; mutating the existing Video keeps identity-equal, so
+    without an explicit emit the dock would not refresh. Mirrors the
+    pattern in `ReplaceVideo.do_action` (`commands.py:3120`).
+  - **No keyboard shortcut.** Rare, intentional action; not worth a
+    single-key binding.
+- **Unit-style verification (2026-05-07, headless):** built a temp folder
+  with 3 PNGs, created a `Labels` containing the resulting Video, dropped
+  2 more PNGs into the folder, called `SyncDLCImageFolder.do_action`
+  against a fake context. Result: filename list grew 3 → 5; new entries
+  appended at indices 3-4; original indices 0-2 unchanged in name and
+  position; emit + changestack_push fired exactly once. Re-running with no
+  disk change produced "no new images found" with no emit and no push —
+  project would stay clean. Output captured in conversation transcript.
+- **Pending manual verification (T12 acceptance criteria from TASKS.md):**
+  1. Sow project, no new files → status bar reads "no new images found";
+     project stays clean.
+  2. Sow project, drop 3 new `imgNNN.png` into the folder → reopen the
+     `.slp` → "Sync DLC image folder" → row count grows by 3, new rows
+     at the bottom show `points = 0/4`, `labeled = 0`; existing rows are
+     pixel-identical (frame number, image name, points, labeled).
+  3. Save → close → reopen → row count and ordering match post-sync.
+  4. Pre-existing label on frame 5 (e.g. `4/4`, `labeled = 1`) survives
+     a sync run.
+  5. Multi project: same flow → new rows show `points = 0/39`.
+  6. Missing provenance key (legacy `.slp`) → status-bar message naming
+     the missing field; nothing else changes.
+  7. Folder renamed on disk → status bar reads "image folder not found
+     on disk: …"; project stays clean.
+  8. Re-export DLC CSV after a successful sync → CSV image column lists
+     original images, then new ones in append order; new rows have empty
+     x/y cells.

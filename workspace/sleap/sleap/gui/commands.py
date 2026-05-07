@@ -320,6 +320,10 @@ class CommandContext:
         """Stamp today's ISO date into `labels.provenance['date']`."""
         self.execute(MarkFolderFinished)
 
+    def syncDLCImageFolder(self):
+        """Append new images on disk into the project's frozen image list."""
+        self.execute(SyncDLCImageFolder)
+
     def exportDLCCSV(self):
         """Export a DLC CollectedData_<scorer>.csv for the current DLC project."""
         self.execute(ExportDLCCSV)
@@ -1017,6 +1021,97 @@ class MarkFolderFinished(AppCommand):
     def do_action(context: CommandContext, params: dict):
         context.labels.provenance["date"] = datetime.now().isoformat(
             timespec="minutes"
+        )
+
+
+class SyncDLCImageFolder(AppCommand):
+    """Append-only sync between the DLC image folder and the open project.
+
+    The wizard freezes the folder's image list into the `.slp` at finish time
+    (see sleap_io `io/slp.py:359`), so files added to the folder afterwards
+    are invisible until the project is rebuilt. This command picks up only
+    the *new* files (by basename) and appends them to the existing list,
+    preserving the order of all already-stored frames so existing labels
+    remain bound to the correct images.
+    """
+
+    topics = [UpdateTopic.video, UpdateTopic.frame]
+
+    @staticmethod
+    def do_action(context: CommandContext, params: dict):
+        from pathlib import Path
+
+        labels = context.labels
+        image_folder = labels.provenance.get("image_folder")
+
+        def _status(msg: str):
+            status_bar = getattr(context.app, "statusBar", None)
+            if callable(status_bar):
+                status_bar().showMessage(msg, 5000)
+            else:
+                print(msg)
+
+        if not image_folder:
+            _status(
+                "Sync DLC image folder: project is missing provenance "
+                "`image_folder` — open via File → New DLC Project first."
+            )
+            return
+
+        folder = Path(image_folder)
+        if not folder.is_dir():
+            _status(
+                f"Sync DLC image folder: image folder not found on disk: {folder}"
+            )
+            return
+
+        if len(labels.videos) != 1:
+            _status(
+                "Sync DLC image folder: project must contain exactly one video."
+            )
+            return
+
+        video = labels.videos[0]
+        if not isinstance(video.filename, list):
+            _status(
+                "Sync DLC image folder: project video is not an image sequence."
+            )
+            return
+
+        existing_paths = list(video.filename)
+        existing_basenames = {Path(p).name for p in existing_paths}
+
+        try:
+            on_disk = Video.from_filename(str(folder)).filename
+        except Exception as e:
+            _status(f"Sync DLC image folder: could not read folder ({e}).")
+            return
+
+        if not isinstance(on_disk, list):
+            _status(
+                "Sync DLC image folder: folder did not expand to an image list."
+            )
+            return
+
+        new_paths = [p for p in on_disk if Path(p).name not in existing_basenames]
+        if not new_paths:
+            _status(
+                f"Sync DLC image folder: no new images found in {folder}."
+            )
+            return
+
+        merged_paths = existing_paths + new_paths
+        video.replace_filename(merged_paths, open=True)
+
+        # Mutating an existing Video in place leaves state["video"] identity-
+        # equal, so DLCFramesDock's connect callback won't fire. Explicit
+        # emit forces the dock to re-run object_to_items on the longer list.
+        # Mirrors the pattern used by ReplaceVideo.do_action.
+        context.state.emit("video")
+        context.changestack_push("sync dlc image folder")
+        _status(
+            f"Sync DLC image folder: added {len(new_paths)} new image(s) "
+            f"(was {len(existing_paths)}, now {len(merged_paths)})."
         )
 
 
