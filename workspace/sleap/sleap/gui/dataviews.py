@@ -686,6 +686,10 @@ class SkeletonNodeModel(QtCore.QStringListModel):
 # a keypoint requires navigating to the frame first.
 DLC_LABELED_THRESHOLD = 2
 
+# T15: column layouts for single-config vs dual-config DLC projects.
+_DLC_SINGLE_COLUMNS = ("frame", "image", "points", "labeled")
+_DLC_DUAL_COLUMNS = ("frame", "image", "sow_pts", "piglet_pts", "labeled")
+
 
 def _dlc_denominator_parts(labels):
     """Return (n_nodes, n_expected_instances) for the DLC points column.
@@ -699,6 +703,27 @@ def _dlc_denominator_parts(labels):
     n_nodes = len(labels.skeletons[0].nodes)
     n_expected = max(1, len(labels.tracks))
     return n_nodes, n_expected
+
+
+def _is_dual_mode(labels) -> bool:
+    """True if the project is a dual-skeleton DLC project (T13)."""
+    if labels is None:
+        return False
+    if labels.provenance.get("mode") != "dlc_dual":
+        return False
+    return len(labels.skeletons) >= 2
+
+
+def _dlc_dual_denominators(labels):
+    """Return (n_sow, n_piglet_total) point budgets for the dual columns.
+
+    `n_sow` = nodes on the sow skeleton (cap-1 instance).
+    `n_piglet_total` = piglet_nodes × len(tracks), the full piglet budget.
+    """
+    sow_nodes = len(labels.skeletons[0].nodes)
+    piglet_nodes = len(labels.skeletons[1].nodes)
+    n_piglet_total = piglet_nodes * len(labels.tracks)
+    return sow_nodes, n_piglet_total
 
 
 def _count_labeled_points(labeled_frame) -> int:
@@ -720,15 +745,43 @@ def _count_labeled_points(labeled_frame) -> int:
     return total
 
 
+def _dlc_dual_counts(labeled_frame):
+    """Return (sow_labeled, piglet_labeled) for the dual-mode columns.
+
+    `sow_labeled` is ``None`` if no sow instance (1st user instance) exists
+    on the frame yet — surfaced as ``"—/4"`` so the labeler can see the
+    sow placeholder is still missing. Otherwise it's the visible-point
+    count on the 1st user instance.
+
+    `piglet_labeled` is the sum of visible points across user instances
+    2..N. T6e (extended by T14) caps this at len(tracks).
+    """
+    if labeled_frame is None:
+        return None, 0
+    user_insts = labeled_frame.user_instances
+    if not user_insts:
+        return None, 0
+    sow_lab = user_insts[0].n_visible
+    pig_lab = sum(inst.n_visible for inst in user_insts[1:])
+    return sow_lab, pig_lab
+
+
 class DLCFramesTableModel(GenericTableModel):
     """One row per image file in an ImageVideo-backed video.
 
     Populated from a `Video` (not a list): when its `filename` is a
     `list[str]` (ImageVideo backend), each entry becomes a row. For
     MediaVideo/HDF5Video backends, the table is empty — non-applicable.
+
+    Columns adapt to the project mode at items-set time:
+      - Single-config (legacy): ``frame | image | points | labeled``
+      - Dual (T13 `mode == "dlc_dual"`): ``frame | image | sow_pts |
+        piglet_pts | labeled``
+    The column swap relies on the `items` setter's `beginResetModel` /
+    `endResetModel` calls (`GenericTableModel.items.setter`).
     """
 
-    properties = ("frame", "image", "points", "labeled")
+    properties = _DLC_SINGLE_COLUMNS
 
     def object_to_items(self, video):
         fn = getattr(video, "filename", None)
@@ -736,46 +789,113 @@ class DLCFramesTableModel(GenericTableModel):
             return []
 
         labels = self.context.labels if self.context is not None else None
-        n_nodes, n_expected = _dlc_denominator_parts(labels)
-        total = n_nodes * n_expected
+        is_dual = _is_dual_mode(labels)
+
+        # Adapt the column layout to the project mode. The surrounding
+        # `items` setter wraps this call in begin/endResetModel, so the
+        # column count change is picked up by the view automatically.
+        self.properties = _DLC_DUAL_COLUMNS if is_dual else _DLC_SINGLE_COLUMNS
+
+        if is_dual:
+            n_sow, n_piglet_total = _dlc_dual_denominators(labels)
+        else:
+            n_nodes, n_expected = _dlc_denominator_parts(labels)
+            total = n_nodes * n_expected
 
         items = []
         for i, f in enumerate(fn):
-            labeled = 0
+            lf = None
             if labels is not None:
                 lfs = labels.find(video=video, frame_idx=i, return_new=False)
                 if lfs:
-                    labeled = _count_labeled_points(lfs[0])
-            items.append(
-                {
-                    "frame": i + 1,
-                    "image": Path(f).name,
-                    "points": f"{labeled}/{total}",
-                    "labeled": 1 if labeled >= DLC_LABELED_THRESHOLD else 0,
-                    "_frame_idx": i,
-                    "_video": video,
-                }
-            )
+                    lf = lfs[0]
+
+            row = {
+                "frame": i + 1,
+                "image": Path(f).name,
+                "_frame_idx": i,
+                "_video": video,
+            }
+            if is_dual:
+                sow_lab, pig_lab = _dlc_dual_counts(lf)
+                row["sow_pts"] = (
+                    f"{sow_lab}/{n_sow}"
+                    if sow_lab is not None
+                    else f"—/{n_sow}"
+                )
+                row["piglet_pts"] = f"{pig_lab}/{n_piglet_total}"
+                # Strict rule (T15): a row counts as labeled only when BOTH
+                # skeletons meet the threshold. Re-evaluate during T18.
+                row["labeled"] = (
+                    1
+                    if (
+                        sow_lab is not None
+                        and sow_lab >= DLC_LABELED_THRESHOLD
+                        and pig_lab >= DLC_LABELED_THRESHOLD
+                    )
+                    else 0
+                )
+            else:
+                labeled = _count_labeled_points(lf) if lf is not None else 0
+                row["points"] = f"{labeled}/{total}"
+                row["labeled"] = (
+                    1 if labeled >= DLC_LABELED_THRESHOLD else 0
+                )
+            items.append(row)
         return items
 
     def update_row_for_frame(self, frame_idx: int, labeled_frame) -> None:
-        """Recompute the derived cells (`points`, `labeled`) for a single row.
+        """Recompute the derived cells for a single row.
 
         Called from `on_data_update` when a user command mutates the current
         frame. Updates only the affected row so scroll position and row
-        selection are preserved. Emits one `dataChanged` spanning both
-        derived columns to avoid redundant repaints.
+        selection are preserved. Emits one `dataChanged` spanning the derived
+        columns to avoid redundant repaints.
         """
         if not (0 <= frame_idx < len(self._data)):
             return
         labels = self.context.labels if self.context is not None else None
-        n_nodes, n_expected = _dlc_denominator_parts(labels)
-        total = n_nodes * n_expected
-        labeled = _count_labeled_points(labeled_frame) if labeled_frame is not None else 0
-        self._data[frame_idx]["points"] = f"{labeled}/{total}"
-        self._data[frame_idx]["labeled"] = 1 if labeled >= DLC_LABELED_THRESHOLD else 0
-        points_col = self.properties.index("points")
-        labeled_col = self.properties.index("labeled")
-        top_left = self.index(frame_idx, points_col)
-        bottom_right = self.index(frame_idx, labeled_col)
-        self.dataChanged.emit(top_left, bottom_right)
+        is_dual = _is_dual_mode(labels)
+
+        if is_dual:
+            n_sow, n_piglet_total = _dlc_dual_denominators(labels)
+            sow_lab, pig_lab = _dlc_dual_counts(labeled_frame)
+            self._data[frame_idx]["sow_pts"] = (
+                f"{sow_lab}/{n_sow}"
+                if sow_lab is not None
+                else f"—/{n_sow}"
+            )
+            self._data[frame_idx]["piglet_pts"] = (
+                f"{pig_lab}/{n_piglet_total}"
+            )
+            self._data[frame_idx]["labeled"] = (
+                1
+                if (
+                    sow_lab is not None
+                    and sow_lab >= DLC_LABELED_THRESHOLD
+                    and pig_lab >= DLC_LABELED_THRESHOLD
+                )
+                else 0
+            )
+            first_col_name = "sow_pts"
+        else:
+            n_nodes, n_expected = _dlc_denominator_parts(labels)
+            total = n_nodes * n_expected
+            labeled = (
+                _count_labeled_points(labeled_frame)
+                if labeled_frame is not None
+                else 0
+            )
+            self._data[frame_idx]["points"] = f"{labeled}/{total}"
+            self._data[frame_idx]["labeled"] = (
+                1 if labeled >= DLC_LABELED_THRESHOLD else 0
+            )
+            first_col_name = "points"
+
+        if first_col_name not in self.properties or "labeled" not in self.properties:
+            return
+        first = self.properties.index(first_col_name)
+        last = self.properties.index("labeled")
+        self.dataChanged.emit(
+            self.index(frame_idx, first), self.index(frame_idx, last)
+        )

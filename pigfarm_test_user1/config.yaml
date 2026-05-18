@@ -1,0 +1,39 @@
+SuperAnimalConversionTables: null
+Task: PigFarm_Sow_Test
+TrainingFraction: [0.95]
+alphavalue: 0.7
+batch_size: 8
+bodyparts: [left_ear, right_ear, torso, hip]
+colormap: rainbow
+corner2move2: [50, 50]
+cropping: false
+date: Apr17
+default_augmenter: default
+default_net_type: resnet_50
+detector_batch_size: 1
+detector_snapshotindex: -1
+dotsize: 12
+engine: pytorch
+identity: null
+iteration: 0
+move2corner: true
+multianimalproject: false
+numframes2pick: 20
+pcutoff: 0.6
+project_path: /home/jiale/Jiale_Research/PigVLM/PigFarmDataProcessing/deeplabcut/PigFarm_Sow_Test-jiale-2026-04-17
+scorer: jiale
+skeleton:
+- [left_ear, torso]
+- [right_ear, torso]
+- [torso, hip]
+skeleton_color: black
+snapshotindex: -1
+start: 0
+stop: 1
+video_sets:
+  ? /home/jiale/Jiale_Research/PigVLM/PigFarmDataProcessing/deeplabcut/1_data_curation/clips/ch07_Crate08_20220430040000_20220430060000_clip_00h40m00s.mp4
+  : {crop: '0, 1100, 0, 900'}
+x1: 0
+x2: 640
+y1: 277
+y2: 624

@@ -210,6 +210,11 @@ class QtVideoPlayer(QWidget):
 
         self._shift_key_down = False
 
+        # T16: skeletons hidden by the dual-mode show/hide toggles. The set
+        # persists across frame changes; `addInstance` checks it when a new
+        # QtInstance is added so newly-plotted frames respect the toggle.
+        self._hidden_skeletons: set = set()
+
         self.color_manager = color_manager or ColorManager()
         self.state = state or GuiState()
         self.shortcuts = Shortcuts()
@@ -504,6 +509,34 @@ class QtVideoPlayer(QWidget):
 
             # connect signal so we can adjust QtNodeLabel positions after zoom
             self.view.updatedViewer.connect(instance.updatePoints)
+
+            # T16: honor dual-mode skeleton-hide toggles for newly plotted
+            # instances. Compare by identity since `_hidden_skeletons` holds
+            # the same Skeleton objects as `labels.skeletons`.
+            if self._hidden_skeletons:
+                inst_skel = getattr(instance.instance, "skeleton", None)
+                if inst_skel is not None and any(
+                    inst_skel is s for s in self._hidden_skeletons
+                ):
+                    instance.setVisible(False)
+
+    def setSkeletonVisible(self, skeleton, visible: bool):
+        """Show/hide all instances belonging to ``skeleton``.
+
+        Tracks the choice in ``self._hidden_skeletons`` so newly-plotted
+        frames respect the toggle. T16: wired to the per-skeleton
+        checkboxes on `DLCFramesDock` for dual-mode DLC projects.
+        """
+        if visible:
+            self._hidden_skeletons.discard(skeleton)
+        else:
+            self._hidden_skeletons.add(skeleton)
+        for inst in self.instances:
+            if inst.instance.skeleton is skeleton:
+                inst.setVisible(visible)
+        for inst in self.predicted_instances:
+            if inst.instance.skeleton is skeleton:
+                inst.setVisible(visible)
 
     def plot(self, *args):
         """Do the actual plotting of the video frame."""

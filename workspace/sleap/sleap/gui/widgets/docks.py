@@ -8,6 +8,7 @@ from typing import Callable, Iterable, List, Optional, Type, Union
 from qtpy import QtGui
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QGroupBox,
@@ -646,9 +647,63 @@ class DLCFramesDock(DockWidget):
     def lay_everything_out(self) -> None:
         self.wgt_layout.addWidget(self.table)
 
+        # T16: dual-mode show/hide toggles. Hidden in single-config projects
+        # (one skeleton); revealed by `_on_video_changed` for `dlc_dual`.
+        self._sow_toggle = QCheckBox("Show sow")
+        self._sow_toggle.setChecked(True)
+        self._sow_toggle.toggled.connect(self._on_sow_toggled)
+
+        self._piglet_toggle = QCheckBox("Show piglets")
+        self._piglet_toggle.setChecked(True)
+        self._piglet_toggle.toggled.connect(self._on_piglet_toggled)
+
+        toggle_row = QHBoxLayout()
+        toggle_row.addWidget(self._sow_toggle)
+        toggle_row.addWidget(self._piglet_toggle)
+        toggle_row.addStretch()
+        self._toggle_widget = QWidget()
+        self._toggle_widget.setLayout(toggle_row)
+        self._toggle_widget.setVisible(False)
+        self.wgt_layout.addWidget(self._toggle_widget)
+
+    def _is_dual_project(self) -> bool:
+        labels = getattr(self.main_window, "labels", None)
+        if labels is None:
+            return False
+        if labels.provenance.get("mode") != "dlc_dual":
+            return False
+        return len(labels.skeletons) >= 2
+
+    def _on_sow_toggled(self, checked: bool):
+        labels = self.main_window.labels
+        if labels is not None and labels.skeletons:
+            self.main_window.player.setSkeletonVisible(
+                labels.skeletons[0], checked
+            )
+
+    def _on_piglet_toggled(self, checked: bool):
+        labels = self.main_window.labels
+        if labels is not None and len(labels.skeletons) >= 2:
+            self.main_window.player.setSkeletonVisible(
+                labels.skeletons[1], checked
+            )
+
     def _on_video_changed(self, video):
         # Setting `items` on the model triggers object_to_items(video).
         self.model.items = video
+
+        # T16: surface the per-skeleton toggles only for dual projects.
+        is_dual = self._is_dual_project()
+        if hasattr(self, "_toggle_widget"):
+            self._toggle_widget.setVisible(is_dual)
+            if is_dual:
+                # Reset both to visible whenever a new dual project loads.
+                self._sow_toggle.blockSignals(True)
+                self._piglet_toggle.blockSignals(True)
+                self._sow_toggle.setChecked(True)
+                self._piglet_toggle.setChecked(True)
+                self._sow_toggle.blockSignals(False)
+                self._piglet_toggle.blockSignals(False)
 
     def _on_frame_changed(self, frame_idx):
         if frame_idx is None:

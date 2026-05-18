@@ -557,3 +557,280 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
     on-demand means an unchanged folder produces zero side effects on
     open — important for the workflow where users open a project just to
     review CSV output before upload.
+
+## Phase 6 — Dual-Skeleton Labeling (sow + piglets in one `.slp`)
+
+**Motivation (2026-05-12 session):** every image in `sleap_label/` is
+training material for *two* DLC models — a single-animal sow model and a
+multi-animal piglet model. Today the wizard reads ONE `config.yaml` and the
+resulting `.slp` contains one skeleton. To avoid double-labeling each image
+in two separate projects, the wizard should optionally pair a sow yaml with
+a piglet yaml, producing a single `.slp` whose `labels.skeletons` holds
+both. Export then splits back into two CSVs, one per DLC project folder on
+disk. Upstream `sleap_io` needs no changes — `Labels.provenance` is a
+free-form dict (T4 verified round-trip), and the DLC server scripts consume
+each project folder independently.
+
+**Pre-decided facts (2026-05-12 session with user):**
+1. **Storage = one `.slp`, two skeletons.** `labels.skeletons[0]` is the
+   sow skeleton (4 nodes, no tracks); `labels.skeletons[1]` is the piglet
+   skeleton (3 nodes, 13 tracks). Verified `sleap_io.Labels.skeletons` is
+   already a list and `state["skeleton"]` is the active-skeleton pointer.
+2. **Mode = `"dlc_dual"` explicit, not inferred.** `provenance["mode"]`
+   becomes one of `"dlc"` (legacy single-yaml) or `"dlc_dual"` (this
+   phase). Reason: the export path forks fundamentally (1 CSV vs 2 CSVs to
+   2 output folders), so a named mode keeps the fork obvious in code and
+   greppable in saved files. Inferring from `len(labels.skeletons) > 1`
+   would also work — explicit is the chosen convention.
+3. **Positional skeleton assignment.** The Nth user instance on a frame
+   maps to a skeleton positionally: instance 1 → sow, instances 2–14 →
+   piglets (the Nth-2 individual per T10's trackless rule). Labelers do
+   NOT toggle an active skeleton — pressing `1` always does the right
+   thing based on current instance count. Cap becomes 14 per frame.
+4. **Missing sow → empty placeholder.** When sow is not visible, the
+   labeler still presses `1` once to create a sow instance with no
+   keypoints placed (all 4 nodes stay occluded → empty CSV cells per
+   `MUST_KNOW §3A`). This preserves the "1st = sow" invariant and avoids
+   ambiguity on piglet-only frames.
+5. **Same scorer in both yamls.** The wizard parses both and aborts (with
+   a status-label message) if the `scorer:` fields differ — a single
+   `.slp` cannot have a labeler conflict.
+6. **One image folder, one dataset name.** Both DLC projects on disk
+   share the same image folder under `labeled-data/<basename>/`. The
+   wizard's metadata page (T4) and folder-picker page (T6) are unchanged.
+7. **Backward compatibility.** Existing single-yaml projects keep
+   `mode == "dlc"` and the old single-skeleton behavior. Nothing about
+   T6a–T12 changes for those projects.
+
+### T13. Wizard — "pair with second config" checkbox + dual-yaml parse ⬜
+- **Depends on:** T5, T6, T12
+- **Do:**
+  1. In `_DLCYamlPage` (`workspace/sleap/sleap/gui/commands.py:818`), add
+     a `QCheckBox("Pair with a second config (dual sow + piglets)")`
+     directly below the existing path row. Default unchecked.
+  2. When toggled on, reveal a second path row (`QLineEdit` + `Browse…`
+     button + status label) using the same widget pattern as the first.
+     Hide the row when unchecked.
+  3. Extend `validatePage()`:
+     - **Unchecked path:** existing single-yaml behavior; sets
+       `wizard._skeleton`, `wizard._tracks`, `wizard._scorer`,
+       `wizard._config_yaml`, and `wizard._mode = "dlc"`.
+     - **Checked path:** parse both yamls via `_parse_dlc_yaml`. Verify
+       one is single-animal (no `multianimalproject`) and one is
+       multi (`multianimalproject: true`); auto-assign roles by that
+       flag (either picker slot may hold either role). Verify
+       `scorer_sow == scorer_piglet`. On any mismatch, write the error
+       to the second status label and return `False`. On success, set:
+       ```python
+       wizard._skeleton_sow      = sow_skel
+       wizard._skeleton_piglet   = piglet_skel
+       wizard._tracks            = piglet_tracks
+       wizard._scorer            = scorer  # same in both
+       wizard._config_yaml_sow   = <abs path>
+       wizard._config_yaml_piglet= <abs path>
+       wizard._mode              = "dlc_dual"
+       ```
+  4. In `NewDLCProject.do_action` (the Finish handler), branch on
+     `wizard._mode`. For `"dlc_dual"`, append BOTH skeletons to
+     `labels.skeletons` (sow first, piglet second) and copy `tracks` from
+     the piglet skeleton. Write provenance:
+     ```python
+     labels.provenance["mode"]                = "dlc_dual"
+     labels.provenance["sow_config_yaml"]     = wizard._config_yaml_sow
+     labels.provenance["piglet_config_yaml"]  = wizard._config_yaml_piglet
+     labels.provenance["labeler"]             = wizard._scorer
+     # dataset, date, image_folder unchanged (set by T4/T6/T12 paths)
+     ```
+- **Accept:**
+  - Wizard opened → checkbox unchecked → existing single-yaml flow
+    works unchanged; `provenance["mode"] == "dlc"` after Finish.
+  - Checkbox checked → pick sow yaml + multi yaml (in either order) →
+    skeleton panel shows BOTH skeletons (4 sow nodes + 3 piglet nodes)
+    and 13 tracks → save `.slp` → reopen →
+    `len(labels.skeletons) == 2`, `provenance["mode"] == "dlc_dual"`,
+    both `*_config_yaml` keys present.
+  - Pick two single-animal yamls (or two multi yamls) → status label
+    says "one config must be single-animal and one must be multi";
+    Next stays disabled.
+  - Pick yamls whose `scorer:` differs → status label says "scorer
+    mismatch (<a> vs <b>)"; Next stays disabled.
+
+### T14. Positional skeleton assignment in `NewInstance` ⬜
+- **Depends on:** T13, T6e
+- **Context:** T6e already gates `NewInstance.do_action`
+  (`commands.py:613`) on `n_user >= max_instances`, with
+  `max_instances = max(1, len(labels.tracks))`. For dual mode, that cap
+  becomes `1 + len(labels.tracks) = 14`, and the skeleton chosen for the
+  new instance depends on the current count.
+- **Do:**
+  1. At the top of `NewInstance.do_action`, after computing `n_user`,
+     branch on `labels.provenance.get("mode") == "dlc_dual"`:
+     - `max_instances = 1 + len(labels.tracks)` (sow + piglets).
+     - `target_skel = labels.skeletons[0] if n_user == 0 else labels.skeletons[1]`.
+  2. For legacy modes (`"dlc"` or absent), keep the existing
+     `max(1, len(labels.tracks))` cap and `labels.skeletons[0]` as the
+     only skeleton. No regression.
+  3. Pass `target_skel` to the instance constructor (where the existing
+     code uses the implicit-first-skeleton path, replace it with the
+     selected skeleton). Verify `sleap_io.Instance` accepts the skeleton
+     parameter — if not, follow the same construction pattern as
+     `LoadProjectFile` or `_DLCYamlPage`.
+  4. Status-bar rejection message updates to use the new cap value
+     ("Frame already has the maximum 14 instance(s); cannot add another").
+- **Accept:**
+  - Dual project on any frame → press `1` once → sow instance appears
+    (4 nodes from sow skeleton, no track) → `points` columns from T15
+    read `sow_pts = 0/4`, `piglet_pts = 0/39`.
+  - Press `1` again → piglet instance appears (3 nodes, assigned to
+    `tracks[0]`) → `piglet_pts = 0/39` (instance present but no points
+    placed yet; per-instance breakdown surfaces during labeling).
+  - Press `1` thirteen more times → 1 sow + 13 piglets exist; 15th
+    press shows the cap message.
+  - Single-yaml project (legacy `mode == "dlc"`) → caps and behavior
+    identical to T6e — sow project caps at 1, multi at 13.
+  - Prediction-only instances do not consume the user budget
+    (preserve T6e invariant).
+
+### T15. DLC Image Frames dock — `sow_pts` + `piglet_pts` columns ⬜
+- **Depends on:** T13, T6b, T6c
+- **Do:**
+  1. In `DLCFramesTableModel` (`workspace/sleap/sleap/gui/dataviews.py:677`),
+     branch on `context.labels.provenance.get("mode")`:
+     - Legacy (`"dlc"`): keep `("frame", "image", "points", "labeled")`.
+     - Dual (`"dlc_dual"`): use `("frame", "image", "sow_pts",
+       "piglet_pts", "labeled")`.
+  2. `sow_pts` cell value: `f"{L}/{n_sow_nodes}"` where `L` is the count
+     of visible nodes on the 1st user instance (`labels.skeletons[0]`).
+     If no sow instance exists, show `"—/4"`.
+  3. `piglet_pts` cell value: `f"{L}/{n_piglet_nodes * len(tracks)}"`
+     summed across user instances 2..N.
+  4. `labeled` semantics (strict, per design §6): flips to `1` only when
+     BOTH skeletons meet `DLC_LABELED_THRESHOLD = 2` visible points.
+     Reuse the constant from T6c.
+  5. Refresh hook from T6b/T6c carries over — emit `dataChanged` for
+     the affected row only.
+- **Decision to surface (strict vs lenient — revisit):** strict was
+  chosen because dual mode's whole purpose is "both models get data per
+  frame". If a session shows the sow is genuinely absent for long
+  stretches (e.g., camera fixed on a partial view), strict forces ghost
+  placeholders on every such frame. Switching to "either" is a one-line
+  change to the `labeled` predicate (`or` instead of `and`). Re-evaluate
+  during T18.
+- **Accept:**
+  - Open a fresh dual project → all rows show `sow_pts = —/4`,
+    `piglet_pts = 0/39`, `labeled = 0`.
+  - Press `1` once on frame 3 (creates empty sow) → row 3 reads
+    `sow_pts = 0/4`, `piglet_pts = 0/39`, `labeled = 0`.
+  - Place 4 sow keypoints → `sow_pts = 4/4`; `labeled` still `0`
+    (piglets below threshold).
+  - Press `1` 13 more times, label 2 nodes on the 1st piglet, leave
+    rest empty → `piglet_pts = 2/39`, `labeled = 1` (both ≥2).
+  - Single-yaml project unchanged: 4-column layout from T6b/T6c.
+
+### T16. Per-skeleton viewer color + show/hide toggle ⬜
+- **Depends on:** T13
+- **Do:**
+  1. In the viewer (search `sleap/gui/widgets/video.py` for instance/edge
+     coloring — likely `QtInstance` and its color helper around
+     `video.py:497`), branch coloring on the instance's skeleton:
+     - Sow skeleton instances render edges/nodes in a single distinct
+       color (suggested: bright white `#FFFFFF`, possibly with thicker
+       lines).
+     - Piglet skeleton instances keep the existing per-track palette
+       cycle.
+     Pick the exact sow color while running the GUI — must be visually
+     distinct against pig fur (light pink/cream) and image background.
+  2. Add two checkboxes to the right-side dock (next to "DLC Image
+     Frames"): **Show sow** and **Show piglets**. Both default to
+     checked. Wire them to a `MainWindow._dlc_show_skel = {"sow": True,
+     "piglet": True}` dict; toggling repaints the viewer.
+  3. The hide toggles affect rendering only — they do NOT affect the
+     `sow_pts`/`piglet_pts` columns or the `NewInstance` cap.
+- **Decision to surface (color choice — revisit during impl):** white is
+  the proposal because piglets are colored. If the image background is
+  often white (lighting overexposure), pick a different distinct color
+  (e.g., cyan or magenta).
+- **Accept:**
+  - Dual project with both skeletons labeled on the same frame → sow
+    instance renders in distinct color; 13 piglet instances cycle the
+    existing palette.
+  - Uncheck "Show piglets" → only the sow instance is visible; checking
+    it again restores all 13 piglets.
+  - Single-yaml project (legacy) → toggles either don't appear, or
+    appear but have no visible effect (only one skeleton exists).
+  - Cap and column behavior unchanged when toggles flip.
+
+### T17. Export — two CSVs in dual mode ⬜
+- **Depends on:** T13, T7, T10, T14
+- **Do:**
+  1. In `ExportDLCCSV.do_action` (`commands.py`, near the existing T7/T10
+     export path), branch on `labels.provenance.get("mode")`:
+     - `"dlc"` or absent: existing single-CSV behavior, no changes.
+     - `"dlc_dual"`: write TWO CSVs as described below.
+  2. In `workspace/sleap/sleap/io/format/dlc_csv.py`, extend
+     `DLCCSVAdaptor.write` (or add a sibling `write_dual`) to accept a
+     `skeleton_filter` argument:
+     - When writing the sow CSV, include only the 1st user instance per
+       frame and use `labels.skeletons[0]`. Single-animal 3-row header
+       (per T7 / `MUST_KNOW §3A`).
+     - When writing the piglet CSV, include user instances 2..N per
+       frame and use `labels.skeletons[1]`. Multi-animal 4-row header
+       (per T10 / `MUST_KNOW §3B`). The Nth-2 user instance maps to
+       `individuals[N-2]` positionally (trackless rule).
+  3. Output paths:
+     - Sow: `<dirname(sow_config_yaml)>/labeled-data/<basename(image_folder)>/CollectedData_<scorer>.csv`
+     - Piglet: `<dirname(piglet_config_yaml)>/labeled-data/<basename(image_folder)>/CollectedData_<scorer>.csv`
+     If either parent directory doesn't exist, create it. If the file
+     already exists, follow the same overwrite-with-confirmation pattern
+     as T7's existing export (re-check what T7 does and match it).
+  4. Status bar: `"Exported sow CSV (N rows) → <sow path>; piglet CSV
+     (M rows) → <piglet path>"`. On any error (missing provenance key,
+     unwritable directory), show a status-bar error and abort both
+     writes — no partial export.
+- **Accept:**
+  - Dual project with ≥5 labeled frames → File → Export DLC CSV → two
+    CSVs land at the two expected paths; status bar shows both row
+    counts.
+  - Diff sow CSV against a reference single-mode export of the same
+    labels — identical header rows, column order, occluded cells
+    truly empty.
+  - Diff piglet CSV against a reference multi-mode export — identical
+    4-row header, `individuals × bodyparts × (x,y)` column order;
+    rows with fewer than 13 piglets have trailing-individual columns
+    empty.
+  - Re-export over existing files → overwrite behavior matches T7's
+    legacy single-CSV behavior.
+  - Single-yaml project → `mode == "dlc"` branch fires; one CSV
+    written exactly as in T7/T10.
+
+### T18. End-to-end smoke test — dual mode ⬜
+- **Depends on:** T13–T17, T6f
+- **Do:** Full flow on `sleap_label/single/ch07_Crate08_..._00h15m00s/`
+  (or whichever folder has both sow and piglet visible across most
+  frames):
+  - File → New DLC Project → check "Pair with second config" → pick the
+    sow `config.yaml` and the multi `config.yaml` → dataset name → image
+    folder → Finish.
+  - Confirm DLC Image Frames dock is frontmost (T6a) and shows columns
+    `frame | image | sow_pts | piglet_pts | labeled`.
+  - For ≥5 frames: press `1` to add sow → place 4 keypoints; press `1`
+    13 more times to add 13 piglets → place 3 keypoints on each (in any
+    order; trackless mapping). Watch sow renders in distinct color
+    (T16). Watch `sow_pts` go 0→4/4 and `piglet_pts` accumulate to
+    39/39; `labeled` flips to 1.
+  - For ≥1 frame: simulate "sow not present" — press `1` once and
+    place NO keypoints (empty sow placeholder); press `1` once more to
+    add 1 piglet and label its 2 visible points. `sow_pts = 0/4`,
+    `piglet_pts = 2/39`, `labeled = 0` (strict rule rejects).
+  - Save `.slp` → close → reopen → all label state intact, both
+    skeletons in `labels.skeletons`, provenance keys present.
+  - File → Export DLC CSV → two CSVs written.
+  - Upload both CSVs to server. Run
+    `python 2_create_project/csv_to_h5_official.py` against each DLC
+    project folder, then
+    `python 2_create_project/check_labels_from_sleap.py` against each.
+- **Accept:** Both server commands exit 0 for both projects. The empty
+  sow placeholder row in the sow CSV has all-empty x/y cells.
+  `docs/PROGRESS.md` captures the command outputs for both projects.
+  Decision recorded on whether to keep strict or switch to lenient
+  `labeled` semantics (T15) based on the workflow feel.

@@ -27,10 +27,12 @@ per MUST_KNOW §4). T6e caps the per-frame instance count at
 """
 
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
 from sleap_io import Labels, Video
+from sleap_io.model.skeleton import Skeleton
 
 from sleap.io.format import adaptor, filehandle
 
@@ -75,6 +77,9 @@ class DLCCSVAdaptor(adaptor.Adaptor):
         video: Video = None,
         scorer: str = None,
         folder_name: str = None,
+        skeleton: Optional[Skeleton] = None,
+        is_multi: Optional[bool] = None,
+        instance_slice: Optional[slice] = None,
     ):
         """Write a DLC CollectedData CSV (single- or multi-animal).
 
@@ -92,6 +97,19 @@ class DLCCSVAdaptor(adaptor.Adaptor):
             scorer: Scorer name (also used in header). Required.
             folder_name: The DLC folder name used in the CSV's combined-path
                 index (i.e. ``labeled-data/<folder_name>/<img>``). Required.
+            skeleton: Which skeleton's nodes drive the column layout.
+                Defaults to ``source_object.skeletons[0]``. T17 passes
+                ``skeletons[0]`` or ``skeletons[1]`` for the sow vs piglet
+                halves of a dual-skeleton project.
+            is_multi: Explicit single/multi format selector. Defaults to
+                ``bool(source_object.tracks)``. T17 passes ``False`` for the
+                sow CSV (which uses single-animal 3-row header even though
+                the project has piglet tracks) and ``True`` for the piglet
+                CSV.
+            instance_slice: Slice of each frame's user-instance list to
+                include. Defaults to ``slice(None)`` (all instances). T17
+                passes ``slice(0, 1)`` for sow (1st instance only) and
+                ``slice(1, None)`` for piglets (2nd onward).
 
         Returns:
             ``True`` if a CSV was written, ``False`` if no labeled frames
@@ -105,14 +123,18 @@ class DLCCSVAdaptor(adaptor.Adaptor):
         if video is None:
             raise ValueError("No video in labels to export.")
 
-        skeleton = source_object.skeletons[0]
+        if skeleton is None:
+            skeleton = source_object.skeletons[0]
         bodyparts = [node.name for node in skeleton.nodes]
         individuals = [t.name for t in source_object.tracks]
-        is_multi = bool(individuals)
+        if is_multi is None:
+            is_multi = bool(individuals)
 
         rows: dict[str, dict[tuple, float]] = {}
         for lf in source_object.find(video):
             user_instances = [i for i in lf.instances if not i.from_predicted]
+            if instance_slice is not None:
+                user_instances = user_instances[instance_slice]
             if not user_instances:
                 continue
 

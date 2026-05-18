@@ -816,12 +816,19 @@ def _parse_dlc_yaml(yaml_path: str) -> Tuple[Skeleton, List[Track], str]:
 
 
 class _DLCYamlPage(QtWidgets.QWizardPage):
-    """Pick a DLC `config.yaml`; stash parsed skeleton/tracks/scorer on the wizard.
+    """Pick a DLC `config.yaml` — optionally a sow yaml AND a piglet yaml.
 
-    `validatePage()` runs on Next — parse errors block advance and are shown
-    in the status label. Successful parse writes `wizard._skeleton`,
-    `wizard._tracks`, `wizard._scorer`, and `wizard._config_yaml` so the
-    image-folder page can seed its Browse dialog at `<config_dir>/labeled-data`.
+    Single-config mode (checkbox unchecked, default): parses one yaml and
+    sets `wizard._mode = "dlc"` along with the standard `_skeleton`,
+    `_tracks`, `_scorer`, `_config_yaml` fields.
+
+    Dual mode (checkbox checked): a second file picker appears. Both yamls
+    are parsed; exactly one must be single-animal and one multi-animal
+    (roles auto-assigned from each yaml's `multianimalproject` flag). Both
+    yamls must share the same `scorer:`. Sets `wizard._mode = "dlc_dual"`
+    plus `_skeleton_sow`, `_skeleton_piglet`, `_tracks` (piglet tracks),
+    `_config_yaml_sow`, `_config_yaml_piglet`. Also sets `_config_yaml` to
+    the sow yaml path so the image-folder page's Browse default still works.
     """
 
     def __init__(self):
@@ -836,16 +843,44 @@ class _DLCYamlPage(QtWidgets.QWizardPage):
         browse_btn = QtWidgets.QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse)
 
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self._path_edit)
-        row.addWidget(browse_btn)
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(self._path_edit)
+        row1.addWidget(browse_btn)
+
+        self._dual_checkbox = QtWidgets.QCheckBox(
+            "Pair with a second config (dual sow + piglets)"
+        )
+        self._dual_checkbox.toggled.connect(self._on_dual_toggled)
+
+        self._path_edit2 = QtWidgets.QLineEdit()
+        self._path_edit2.setReadOnly(True)
+        self._path_edit2.textChanged.connect(self.completeChanged)
+
+        browse_btn2 = QtWidgets.QPushButton("Browse…")
+        browse_btn2.clicked.connect(self._browse2)
+
+        self._row2_widget = QtWidgets.QWidget()
+        row2 = QtWidgets.QHBoxLayout(self._row2_widget)
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.addWidget(self._path_edit2)
+        row2.addWidget(browse_btn2)
+        self._row2_widget.setVisible(False)
 
         self._status = QtWidgets.QLabel("")
         self._status.setWordWrap(True)
 
         layout = QtWidgets.QVBoxLayout(self)
-        layout.addLayout(row)
+        layout.addLayout(row1)
+        layout.addWidget(self._dual_checkbox)
+        layout.addWidget(self._row2_widget)
         layout.addWidget(self._status)
+
+    def _on_dual_toggled(self, checked: bool):
+        self._row2_widget.setVisible(checked)
+        if not checked:
+            self._path_edit2.setText("")
+        self._status.setText("")
+        self.completeChanged.emit()
 
     def _browse(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -855,21 +890,83 @@ class _DLCYamlPage(QtWidgets.QWizardPage):
             self._path_edit.setText(path)
             self._status.setText("")
 
+    def _browse2(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select second DLC config.yaml",
+            "",
+            "DLC config (*.yaml *.yml)",
+        )
+        if path:
+            self._path_edit2.setText(path)
+            self._status.setText("")
+
     def isComplete(self) -> bool:
-        return bool(self._path_edit.text().strip())
+        if not self._path_edit.text().strip():
+            return False
+        if self._dual_checkbox.isChecked() and not self._path_edit2.text().strip():
+            return False
+        return True
 
     def validatePage(self) -> bool:
+        w = self.wizard()
         try:
-            skeleton, tracks, scorer = _parse_dlc_yaml(self._path_edit.text())
+            skel_a, tracks_a, scorer_a = _parse_dlc_yaml(self._path_edit.text())
         except Exception as e:
             self._status.setText(f"Error: {e}")
             return False
 
-        w = self.wizard()
-        w._skeleton = skeleton
-        w._tracks = tracks
-        w._scorer = scorer
-        w._config_yaml = self._path_edit.text()
+        if not self._dual_checkbox.isChecked():
+            w._mode = "dlc"
+            w._skeleton = skel_a
+            w._tracks = tracks_a
+            w._scorer = scorer_a
+            w._config_yaml = self._path_edit.text()
+            return True
+
+        try:
+            skel_b, tracks_b, scorer_b = _parse_dlc_yaml(self._path_edit2.text())
+        except Exception as e:
+            self._status.setText(f"Error in second config: {e}")
+            return False
+
+        if scorer_a != scorer_b:
+            self._status.setText(
+                f"Error: scorer mismatch ({scorer_a!r} vs {scorer_b!r}). "
+                f"Both configs must share the same scorer."
+            )
+            return False
+
+        a_is_multi = bool(tracks_a)
+        b_is_multi = bool(tracks_b)
+        if a_is_multi == b_is_multi:
+            kind = "multi-animal" if a_is_multi else "single-animal"
+            self._status.setText(
+                f"Error: both configs are {kind}. One must be single-animal "
+                f"(sow) and one must be multi-animal (piglets)."
+            )
+            return False
+
+        if a_is_multi:
+            sow_skel, piglet_skel = skel_b, skel_a
+            piglet_tracks = tracks_a
+            sow_yaml = self._path_edit2.text()
+            piglet_yaml = self._path_edit.text()
+        else:
+            sow_skel, piglet_skel = skel_a, skel_b
+            piglet_tracks = tracks_b
+            sow_yaml = self._path_edit.text()
+            piglet_yaml = self._path_edit2.text()
+
+        w._mode = "dlc_dual"
+        w._skeleton_sow = sow_skel
+        w._skeleton_piglet = piglet_skel
+        w._tracks = piglet_tracks
+        w._scorer = scorer_a
+        w._config_yaml_sow = sow_yaml
+        w._config_yaml_piglet = piglet_yaml
+        # Folder page reads this for its Browse default.
+        w._config_yaml = sow_yaml
         return True
 
 
@@ -980,17 +1077,27 @@ class NewDLCProject(AppCommand):
         if wizard.exec_() != QtWidgets.QDialog.Accepted:
             return
 
+        mode = getattr(wizard, "_mode", "dlc")
+        if mode == "dlc_dual":
+            skeletons = [wizard._skeleton_sow, wizard._skeleton_piglet]
+        else:
+            skeletons = [wizard._skeleton]
+
         labels = Labels(
-            skeletons=[wizard._skeleton],
+            skeletons=skeletons,
             tracks=list(wizard._tracks),
         )
         video = Video.from_filename(wizard._image_folder)
         labels.add_video(video)
-        labels.provenance["mode"] = "dlc"
+        labels.provenance["mode"] = mode
         labels.provenance["dataset"] = Path(wizard._image_folder).name
         labels.provenance["labeler"] = wizard._scorer
-        labels.provenance["config_yaml"] = wizard._config_yaml
         labels.provenance["image_folder"] = wizard._image_folder
+        if mode == "dlc_dual":
+            labels.provenance["sow_config_yaml"] = wizard._config_yaml_sow
+            labels.provenance["piglet_config_yaml"] = wizard._config_yaml_piglet
+        else:
+            labels.provenance["config_yaml"] = wizard._config_yaml
 
         window = context.app.__class__(labels=labels)
         window.showMaximized()
@@ -1119,9 +1226,15 @@ class ExportDLCCSV(AppCommand):
     """Write `CollectedData_<scorer>.csv` into the DLC project's image folder.
 
     Scorer comes from `labels.provenance["labeler"]` (set by the T5 yaml
-    picker). Output folder comes from `labels.provenance["image_folder"]`.
-    Both are required — if either is missing the command aborts with a
-    status-bar message (matches the T6e rejection-UX convention).
+    picker). Output folder(s) come from provenance:
+      - Single-config (`mode == "dlc"`): writes ONE CSV into
+        `provenance["image_folder"]`.
+      - Dual (`mode == "dlc_dual"`): writes TWO CSVs, one per
+        `provenance["{sow,piglet}_config_yaml"]`'s `labeled-data/<basename>/`
+        directory (auto-created if missing). Sow CSV uses the 1st user
+        instance per frame; piglet CSV uses instances 2..N (positional
+        per T14).
+    Aborts with a status-bar message if required provenance is missing.
     """
 
     @staticmethod
@@ -1133,6 +1246,7 @@ class ExportDLCCSV(AppCommand):
         labels = context.labels
         scorer = labels.provenance.get("labeler")
         image_folder = labels.provenance.get("image_folder")
+        mode = labels.provenance.get("mode")
 
         def _status(msg: str):
             status_bar = getattr(context.app, "statusBar", None)
@@ -1158,18 +1272,95 @@ class ExportDLCCSV(AppCommand):
             _status("Export DLC CSV: no video in project.")
             return
 
-        out_path = folder / f"CollectedData_{scorer}.csv"
-
         has_user_labels = any(
             any(not inst.from_predicted for inst in lf.instances)
             for lf in labels.find(video)
         )
         if not has_user_labels:
             _status(
-                f"Export DLC CSV: no labeled frames in video — nothing to "
-                f"write to {out_path}."
+                "Export DLC CSV: no labeled frames in video — nothing to export."
             )
             return
+
+        if mode == "dlc_dual" and len(labels.skeletons) >= 2:
+            sow_yaml = labels.provenance.get("sow_config_yaml")
+            piglet_yaml = labels.provenance.get("piglet_config_yaml")
+            if not sow_yaml or not piglet_yaml:
+                _status(
+                    "Export DLC CSV: dual project missing "
+                    "`sow_config_yaml` or `piglet_config_yaml` in provenance."
+                )
+                return
+
+            sow_root = Path(sow_yaml).parent
+            piglet_root = Path(piglet_yaml).parent
+            for role, root in (("sow", sow_root), ("piglet", piglet_root)):
+                if not root.is_dir():
+                    _status(
+                        f"Export DLC CSV: {role} DLC project folder not found "
+                        f"on disk: {root}"
+                    )
+                    return
+
+            basename = folder.name
+            sow_out_dir = sow_root / "labeled-data" / basename
+            piglet_out_dir = piglet_root / "labeled-data" / basename
+            sow_out_dir.mkdir(parents=True, exist_ok=True)
+            piglet_out_dir.mkdir(parents=True, exist_ok=True)
+            sow_out_path = sow_out_dir / f"CollectedData_{scorer}.csv"
+            piglet_out_path = piglet_out_dir / f"CollectedData_{scorer}.csv"
+
+            existing = [
+                (role, p)
+                for role, p in (("sow", sow_out_path), ("piglet", piglet_out_path))
+                if p.exists()
+            ]
+            if existing:
+                names = "\n".join(f"  {role}: {p}" for role, p in existing)
+                reply = QtWidgets.QMessageBox.question(
+                    context.app,
+                    "Overwrite DLC CSVs?",
+                    f"The following CSV(s) already exist:\n\n{names}\n\n"
+                    f"Overwrite?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                )
+                if reply != QtWidgets.QMessageBox.Yes:
+                    _status("Export DLC CSV: canceled (existing files).")
+                    return
+
+            sow_wrote = DLCCSVAdaptor.write(
+                filename=str(sow_out_path),
+                source_object=labels,
+                video=video,
+                scorer=scorer,
+                folder_name=basename,
+                skeleton=labels.skeletons[0],
+                is_multi=False,
+                instance_slice=slice(0, 1),
+            )
+            piglet_wrote = DLCCSVAdaptor.write(
+                filename=str(piglet_out_path),
+                source_object=labels,
+                video=video,
+                scorer=scorer,
+                folder_name=basename,
+                skeleton=labels.skeletons[1],
+                is_multi=True,
+                instance_slice=slice(1, None),
+            )
+            msg_parts = []
+            if sow_wrote:
+                msg_parts.append(f"sow → {sow_out_path}")
+            if piglet_wrote:
+                msg_parts.append(f"piglet → {piglet_out_path}")
+            if msg_parts:
+                _status("Exported DLC CSVs: " + "; ".join(msg_parts))
+            else:
+                _status("Export DLC CSV: no user instances to write.")
+            return
+
+        # Single-config (legacy) path.
+        out_path = folder / f"CollectedData_{scorer}.csv"
 
         if out_path.exists():
             reply = QtWidgets.QMessageBox.question(
@@ -4450,9 +4641,26 @@ class AddInstance(EditCommand):
             return
 
         lf = context.state["labeled_frame"]
-        # Single-animal projects have 0 tracks; cap stays at 1.
-        max_instances = max(1, len(context.labels.tracks))
-        if len(lf.user_instances) >= max_instances:
+        n_user = len(lf.user_instances)
+
+        # Dual-mode (sow + piglets in one .slp): positional skeleton assignment.
+        # 1st user instance per frame → sow (skeletons[0], cap 1); 2nd-onward →
+        # piglets (skeletons[1], cap len(tracks)). Total cap = 1 + len(tracks).
+        # Single-config projects keep T6e's `max(1, len(tracks))` cap.
+        mode = context.labels.provenance.get("mode")
+        is_dual = mode == "dlc_dual" and len(context.labels.skeletons) >= 2
+        if is_dual:
+            max_instances = 1 + len(context.labels.tracks)
+            target_skeleton = (
+                context.labels.skeletons[0]
+                if n_user == 0
+                else context.labels.skeletons[1]
+            )
+        else:
+            max_instances = max(1, len(context.labels.tracks))
+            target_skeleton = context.state["skeleton"]
+
+        if n_user >= max_instances:
             status_bar = getattr(context.app, "statusBar", None)
             if callable(status_bar):
                 status_bar().showMessage(
@@ -4479,6 +4687,7 @@ class AddInstance(EditCommand):
             location=location,
             from_prev_frame=from_prev_frame,
             offset=offset,
+            skeleton=target_skeleton,
         )
 
         # add new instance
@@ -4507,12 +4716,17 @@ class AddInstance(EditCommand):
         location: Optional[QtCore.QPoint],
         from_prev_frame: bool,
         offset: int = 0,
+        skeleton: Optional[Skeleton] = None,
     ) -> Instance:
-        """Create new instance."""
+        """Create new instance.
+
+        ``skeleton`` overrides ``context.state["skeleton"]`` — used by dual-mode
+        DLC projects to pick the sow or piglet skeleton positionally.
+        """
 
         # Now create the new instance
         new_instance = Instance.empty(
-            skeleton=context.state["skeleton"],
+            skeleton=skeleton or context.state["skeleton"],
             from_predicted=from_predicted,
         )
 
@@ -4644,9 +4858,11 @@ class AddInstance(EditCommand):
             offset_x = location.x() - (reference_x * scale_width)
             offset_y = location.y() - (reference_y * scale_height)
 
-        # Go through each node in skeleton.
-        for node in context.state["skeleton"].node_names:
-            node_idx = context.state["skeleton"].node_names.index(node)
+        # Iterate the new instance's own skeleton (which in dual mode may
+        # differ from context.state["skeleton"]). Then look up source nodes
+        # by name on the copy_instance's skeleton.
+        for node in new_instance.skeleton.node_names:
+            node_idx = new_instance.skeleton.node_names.index(node)
             if node not in copy_instance.skeleton.node_names:
                 has_missing_nodes = True
                 continue
@@ -4888,8 +5104,8 @@ class AddMissingInstanceNodes(EditCommand):
 
         input_arrays = instance.points
 
-        for node_name in context.state["skeleton"].node_names:
-            node_idx = context.state["skeleton"].node_names.index(node_name)
+        for node_name in instance.skeleton.node_names:
+            node_idx = instance.skeleton.node_names.index(node_name)
             if node_name not in instance.points["name"] or np.any(
                 np.isnan(instance.numpy()[node_idx])
             ):
@@ -4995,7 +5211,7 @@ class AddMissingInstanceNodes(EditCommand):
         center_tuple = (center_point.x(), center_point.y())
 
         node_positions = nx.spring_layout(
-            G=to_graph(context.state["skeleton"]), center=center_tuple, scale=50
+            G=to_graph(instance.skeleton), center=center_tuple, scale=50
         )
 
         for node, pos in node_positions.items():

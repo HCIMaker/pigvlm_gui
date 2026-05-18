@@ -268,6 +268,19 @@ class ColorManager:
 
             return (128, 128, 128)
 
+        # T16: dual-mode DLC projects color the sow skeleton with a single
+        # distinct color (cyan) so the labeler can tell the 1st instance
+        # apart from the per-track piglet palette. Skip for predicted
+        # instances rendered with custom colors above.
+        if (
+            parent_skeleton is not None
+            and self.labels is not None
+            and self.labels.provenance.get("mode") == "dlc_dual"
+            and len(self.labels.skeletons) >= 2
+            and parent_skeleton is self.labels.skeletons[0]
+        ):
+            return (0, 255, 255)
+
         if self.distinctly_color == "instances" or hasattr(item, "track"):
             track = None
             if hasattr(item, "track"):
