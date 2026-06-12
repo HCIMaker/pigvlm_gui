@@ -8,6 +8,7 @@ from typing import Callable, Iterable, List, Optional, Type, Union
 from qtpy import QtGui
 from qtpy.QtCore import Qt
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDockWidget,
@@ -17,6 +18,7 @@ from qtpy.QtWidgets import (
     QLayout,
     QMainWindow,
     QPushButton,
+    QStyledItemDelegate,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -26,6 +28,8 @@ from PIL import Image
 
 from sleap.gui.dataviews import (
     DLCFramesTableModel,
+    FRAME_LABEL_FIELDS,
+    FRAME_LABEL_OPTIONS,
     GenericTableModel,
     GenericTableView,
     LabeledFrameTableModel,
@@ -602,6 +606,51 @@ class InstancesDock(DockWidget):
         return hbw
 
 
+class FrameLabelDelegate(QStyledItemDelegate):
+    """Dropdown editor for the DLC dock's frame-label columns (T19).
+
+    One delegate handles all three columns and adapts to whichever layout the
+    model currently exposes (single vs dual). For non-label columns it defers
+    to the default delegate, so the rest of the table is unaffected.
+    """
+
+    @staticmethod
+    def _field_for(index) -> Optional[str]:
+        model = index.model()
+        props = getattr(model, "properties", None)
+        if not props or index.column() >= len(props):
+            return None
+        key = props[index.column()]
+        return key if key in FRAME_LABEL_FIELDS else None
+
+    def createEditor(self, parent, option, index):
+        field = self._field_for(index)
+        if field is None:
+            return super().createEditor(parent, option, index)
+        combo = QComboBox(parent)
+        for token, display in FRAME_LABEL_OPTIONS[field]:
+            combo.addItem(display, token)
+        # Commit + close as soon as the user picks an item (one-click feel).
+        combo.activated.connect(lambda *_: self._commit(combo))
+        return combo
+
+    def _commit(self, editor):
+        self.commitData.emit(editor)
+        self.closeEditor.emit(editor)
+
+    def setEditorData(self, editor, index):
+        if self._field_for(index) is None:
+            return super().setEditorData(editor, index)
+        token = index.data(Qt.EditRole) or ""
+        pos = editor.findData(token)
+        editor.setCurrentIndex(pos if pos >= 0 else 0)
+
+    def setModelData(self, editor, model, index):
+        if self._field_for(index) is None:
+            return super().setModelData(editor, model, index)
+        model.setData(index, editor.currentData(), Qt.EditRole)
+
+
 class DLCFramesDock(DockWidget):
     """Scrollable list of per-frame image filenames for ImageVideo-backed projects.
 
@@ -631,6 +680,26 @@ class DLCFramesDock(DockWidget):
             is_sortable=False,
             model=self.model,
         )
+
+        # T19: dropdown editing for the lying/heat_lamp/food columns. The
+        # delegate no-ops for other columns.
+        self.table.setItemDelegate(FrameLabelDelegate(self.table))
+        self.table.setEditTriggers(
+            QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed
+        )
+
+        def open_label_editor(index):
+            # A single click on a label cell opens its dropdown immediately
+            # (the default triggers need the row pre-selected → two clicks).
+            props = self.model.properties
+            if (
+                index.isValid()
+                and index.column() < len(props)
+                and props[index.column()] in FRAME_LABEL_FIELDS
+            ):
+                self.table.edit(index)
+
+        self.table.clicked.connect(open_label_editor)
 
         def goto_frame(*args):
             item = self.table.getSelectedRowItem()

@@ -16,3 +16,7 @@ Thumbs.db
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Large binaries — exceed GitHub's 100 MB file limit, kept locally only
+Jiale.zip
+gui_tutorial.mp4

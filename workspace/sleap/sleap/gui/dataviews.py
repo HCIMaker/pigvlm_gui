@@ -687,8 +687,56 @@ class SkeletonNodeModel(QtCore.QStringListModel):
 DLC_LABELED_THRESHOLD = 2
 
 # T15: column layouts for single-config vs dual-config DLC projects.
-_DLC_SINGLE_COLUMNS = ("frame", "image", "points", "labeled")
-_DLC_DUAL_COLUMNS = ("frame", "image", "sow_pts", "piglet_pts", "labeled")
+# T19: the three frame-level environment-label columns slot in before "labeled".
+_DLC_SINGLE_COLUMNS = (
+    "frame", "image", "points", "lying", "heat_lamp", "food", "labeled"
+)
+_DLC_DUAL_COLUMNS = (
+    "frame", "image", "sow_pts", "piglet_pts", "lying", "heat_lamp", "food",
+    "labeled",
+)
+
+# T19: frame-level environment labels (see Phase 7 in docs/TASKS.md). These are
+# per-image scalar observations independent of any keypoint/skeleton, stored in
+# `labels.provenance["frame_labels"]` keyed by str(frame_idx) and round-tripped
+# through the .slp via provenance JSON (same store the keypoints live in).
+FRAME_LABEL_FIELDS = ("lying", "heat_lamp", "food")
+
+# (stored/CSV token, dropdown display) per field; token "" is the unset default.
+# Tokens are space-free (user requirement); the friendly text is display-only.
+FRAME_LABEL_OPTIONS = {
+    "lying": [("", "—"), ("up", "up"), ("down", "down"), ("none", "none")],
+    "heat_lamp": [
+        ("", "—"), ("on", "on"), ("off", "off"), ("not_clear", "not clear")
+    ],
+    "food": [
+        ("", "—"),
+        ("3", "3 — very much"),
+        ("2", "2 — middle"),
+        ("1", "1 — almost done"),
+        ("0", "0 — none"),
+    ],
+}
+
+# Column header overrides (GenericTableModel title-cases lowercase keys, which
+# would turn "heat_lamp" into "Heat_Lamp").
+_FRAME_LABEL_HEADERS = {"heat_lamp": "Heat Lamp"}
+
+
+def _frame_label_cell_text(field: str, token: str) -> str:
+    """Compact text shown in a frame-label table cell (unset → ``—``).
+
+    `food` cells stay numeric (3/2/1/0); other fields show their friendly text
+    (e.g. ``not_clear`` → "not clear").
+    """
+    if not token:
+        return "—"
+    if field == "food":
+        return token
+    for tok, disp in FRAME_LABEL_OPTIONS[field]:
+        if tok == token:
+            return disp
+    return token
 
 
 def _dlc_denominator_parts(labels):
@@ -802,6 +850,11 @@ class DLCFramesTableModel(GenericTableModel):
             n_nodes, n_expected = _dlc_denominator_parts(labels)
             total = n_nodes * n_expected
 
+        # T19: per-frame environment labels stored in provenance.
+        frame_labels = (
+            labels.provenance.get("frame_labels", {}) if labels is not None else {}
+        )
+
         items = []
         for i, f in enumerate(fn):
             lf = None
@@ -810,11 +863,15 @@ class DLCFramesTableModel(GenericTableModel):
                 if lfs:
                     lf = lfs[0]
 
+            entry = frame_labels.get(str(i), {})
             row = {
                 "frame": i + 1,
                 "image": Path(f).name,
                 "_frame_idx": i,
                 "_video": video,
+                "lying": entry.get("lying", ""),
+                "heat_lamp": entry.get("heat_lamp", ""),
+                "food": entry.get("food", ""),
             }
             if is_dual:
                 sow_lab, pig_lab = _dlc_dual_counts(lf)
@@ -899,3 +956,67 @@ class DLCFramesTableModel(GenericTableModel):
         self.dataChanged.emit(
             self.index(frame_idx, first), self.index(frame_idx, last)
         )
+
+    # ---- T19: frame-level environment labels (lying / heat_lamp / food) ----
+
+    def data(self, index: QtCore.QModelIndex, role=QtCore.Qt.DisplayRole):
+        """Frame-label cells display friendly text but edit/store the token."""
+        if index.isValid():
+            key = self.properties[index.column()]
+            if key in FRAME_LABEL_FIELDS:
+                token = self.items[index.row()].get(key, "")
+                if role == QtCore.Qt.EditRole:
+                    return token
+                if role in (QtCore.Qt.DisplayRole, QtCore.Qt.ToolTipRole):
+                    return _frame_label_cell_text(key, token)
+        return super().data(index, role)
+
+    def headerData(
+        self, idx: int, orientation: QtCore.Qt.Orientation, role=QtCore.Qt.DisplayRole
+    ):
+        """Override the displayed header for keys that title-case poorly."""
+        if role == QtCore.Qt.DisplayRole and orientation == QtCore.Qt.Horizontal:
+            key = self.properties[idx]
+            if key in _FRAME_LABEL_HEADERS:
+                return _FRAME_LABEL_HEADERS[key]
+        return super().headerData(idx, orientation, role)
+
+    def can_set(self, item, key):
+        """Only the three environment-label columns are editable."""
+        return key in FRAME_LABEL_FIELDS
+
+    def set_item(self, item, key, value):
+        """Persist a dropdown change via `SetFrameLabel` and update the row."""
+        if key not in FRAME_LABEL_FIELDS or self.context is None:
+            return
+        frame_idx = item.get("_frame_idx") if isinstance(item, dict) else None
+        if frame_idx is None:
+            return
+        self.context.setFrameLabel(frame_idx=frame_idx, field=key, value=value)
+        item[key] = value
+
+    def refresh_frame_label_cells(self, frame_idx: int) -> None:
+        """Re-read a frame's environment labels from provenance into its row.
+
+        Used after a programmatic change (e.g. copy-prior-frame, T20) that did
+        not go through this model's `setData`.
+        """
+        if not (0 <= frame_idx < len(self._data)):
+            return
+        labels = self.context.labels if self.context is not None else None
+        frame_labels = (
+            labels.provenance.get("frame_labels", {}) if labels is not None else {}
+        )
+        entry = frame_labels.get(str(frame_idx), {})
+        for field in FRAME_LABEL_FIELDS:
+            self._data[frame_idx][field] = entry.get(field, "")
+        cols = [
+            self.properties.index(field)
+            for field in FRAME_LABEL_FIELDS
+            if field in self.properties
+        ]
+        if cols:
+            self.dataChanged.emit(
+                self.index(frame_idx, min(cols)),
+                self.index(frame_idx, max(cols)),
+            )

@@ -1236,7 +1236,8 @@ config.
 
 ## T12. Sync DLC image folder (append-only, on-demand)
 
-- **Status:** 🔵 implemented + unit-verified, awaits manual GUI smoke test.
+- **Status:** ✅ done — 2026-05-27 (user-accepted after two-round fix for the
+  navigation freeze and status-bar overwrite; see follow-up section below).
 - **What it does:** appends new image files (by basename) from
   `labels.provenance["image_folder"]` to the project's frozen image list
   using `Video.replace_filename(merged_paths, open=True)`. Existing labels
@@ -1299,3 +1300,486 @@ config.
   8. Re-export DLC CSV after a successful sync → CSV image column lists
      original images, then new ones in append order; new rows have empty
      x/y cells.
+
+### T12 follow-up — post-sync navigation + status-message overwrite (2026-05-27)
+
+- **Symptoms reported by user during manual verification:**
+  1. After a successful sync, the dock showed the new rows but the main
+     viewer would not navigate to them: W/S stopped at the old last frame;
+     double-clicking a new row did nothing visible.
+  2. The "added N new image(s)" success message never appeared in the
+     status bar — only the per-frame "Frame X/Y" default was visible.
+  3. Saving and reopening the project made navigation work normally.
+- **Two distinct root causes (the navigation bug took two rounds to find):**
+  - **(A) Status-bar overwrite:** The original `topics = [UpdateTopic.video,
+    UpdateTopic.frame]` triggered a post-`do_action` `signal_update`
+    cascade that ran `plotFrame` → `player.plot()` → `changedPlot` →
+    `_after_plot_change` → `updateStatusMessage()`, clobbering the
+    success message with the per-frame "Frame X/Y" default.
+  - **(B) Worker thread's stale `deepcopy(video)` — the actual cause of
+    the navigation freeze.** `QtVideoPlayer.plot()` dispatches frame
+    reads to a background thread (`widgets/video_worker.py`).
+    `FrameLoaderThread.request_frame` (`video_worker.py:136`) caches a
+    `deepcopy(video)` as `self.local_video_copy` and only refreshes it
+    when `self.current_video is not video` — an **identity** check. Our
+    in-place `replace_filename` keeps the Video object identity equal,
+    so the worker happily kept serving frame reads from a snapshot of
+    the OLD filename list. The seekbar and `state["frame_idx"]` advanced
+    correctly past the original last frame, but every read for a new
+    index either hit an out-of-range path in the frozen deepcopy or
+    silently failed, leaving the viewer stuck on the previous image.
+    Save+reopen masked the bug because `LoadLabelsObject` constructs a
+    *new* Video object — identity changes — so the worker's next
+    `request_frame` saw `current_video is not video` and rebuilt its
+    deepcopy against the new filename list.
+- **Fix (`workspace/sleap/sleap/gui/commands.py` `SyncDLCImageFolder`):**
+  - **`topics = []`** — drop the `do_with_signal` cascade entirely. We
+    now own every piece of GUI refresh needed by this command, so we
+    don't want the generic post-action handlers stepping on our status
+    message or thrashing the seekbar.
+  - **Invalidate the worker thread's cached video snapshot** before
+    calling `player.load_video`:
+    ```python
+    worker = getattr(player, "worker_thread", None)
+    if worker is not None:
+        worker.current_video = None
+        worker.local_video_copy = None
+    ```
+    This is what fixed cause (B) above. Setting `current_video = None`
+    forces the worker's identity check (`self.current_video is not
+    video`) to be True on the next `request_frame`, which re-deepcopies
+    the (now-mutated) video and unblocks reads of the new frame indices.
+    Without this step the player's main thread can advance `frame_idx`
+    past the old end, but no image renders because the worker is still
+    serving from the stale snapshot.
+  - **Explicit `context.app.player.load_video(video)`** after
+    `video.replace_filename(...)`. This is what the player would have
+    done via the emit chain anyway, but calling it directly bypasses
+    any timing fragility and matches what save+reopen does internally.
+  - **Keep `context.state.emit("video")`** for the DLCFramesDock — its
+    `_on_video_changed` callback re-runs `object_to_items` against the
+    longer filename list (this part was already working).
+  - **Explicit `context.app._update_seekbar_marks()`** to repaint
+    user-labeled / suggestion ticks against the now-wider seekbar.
+  - `_status(...)` success message moves to the bottom of `do_action`
+    so it is the LAST status write; with `topics = []` nothing
+    overwrites it until the user navigates (normal behavior).
+- **Headless verification (`$CLAUDE_JOB_DIR/test_sync_fix.py`):**
+  built a temp folder with 3 PNGs, set up a fake MainWindow that wires
+  `player.changedPlot → _after_plot_change → updateStatusMessage`
+  exactly like `app.py:390`, pre-warmed the worker thread's deepcopy
+  by issuing one `request_frame(video, 0)` before sync, dropped 2 more
+  PNGs, ran `SyncDLCImageFolder` via the public `CommandContext.execute`
+  path. After sync:
+  - `len(video)` = 5 (was 3) — backend rebuilt against new file list.
+  - `seekbar._val_max` = 4 (= 5−1) — player.load_video resized it.
+  - `player.video is video` — same object identity preserved.
+  - **Worker thread snapshot at the first `request_frame` call inside
+    sync:** `current_video is None`, `local_video_copy is None` —
+    confirms our invalidation step ran. **Second snapshot (after the
+    refresh):** `local_video_copy.filename` has length 5 — worker now
+    serves from the merged list, not the frozen 3-entry snapshot.
+  - The success message "added 2 new image(s) (was 3, now 5)" is the
+    LAST status write (after the two `Frame X/Y` defaults emitted by
+    the two `plot()` cascades during sync).
+  - `_update_seekbar_marks` called exactly once.
+  - Pressing S from frame_idx=2 (old last) → 3 → 4 navigates into
+    the newly synced frames without wrapping.
+- **Why not use `does_edits = True` + topics:** would have the same
+  status-overwrite + signal_update interference. Keeping
+  `does_edits = False` + manual `changestack_push` preserves the
+  acceptance criterion that an empty sync leaves the project clean.
+- **Pending re-verification with this fix:**
+  - Rerun acceptance criteria 1–8 above; pay particular attention to
+    (2) double-click on new row navigates to that image without
+    save+reopen, and to the success status message being visible for
+    its 5-second timeout.
+
+## T13. Wizard — "pair with second config" checkbox + dual-yaml parse
+
+- **Status:** ✅ done — 2026-05-28 (user-accepted; ran the full dual-mode
+  flow in the wizard, both yamls parsed, both skeletons + 13 tracks
+  showed up in the new project, provenance keys round-trip).
+- **What's in code (`workspace/sleap/sleap/gui/commands.py`):**
+  - `_DLCYamlPage` (`commands.py:818`) — single page that handles both
+    modes via a `QCheckBox("Pair with a second config (dual sow +
+    piglets)")`. Unchecked = legacy single-yaml; checked reveals a
+    second `QLineEdit` + Browse button.
+  - `validatePage()` — single-yaml path is unchanged. Dual path parses
+    both yamls via the existing `_parse_dlc_yaml` helper, enforces two
+    invariants (one must be single-animal, one multi; both must share
+    `scorer:`), then auto-assigns sow/piglet roles from each yaml's
+    `multianimalproject` flag — so the user can pick the two yamls in
+    EITHER order. Status label surfaces error messages; Next stays
+    blocked until both yamls validate.
+  - `NewDLCProject.do_action` (`commands.py:1064`) — branches on
+    `wizard._mode`. For `"dlc_dual"`, builds `Labels(skeletons=[sow,
+    piglet], tracks=<piglet tracks>)` and writes provenance keys
+    `mode = "dlc_dual"`, `sow_config_yaml`, `piglet_config_yaml`,
+    `labeler`, `image_folder`, `dataset = Path(image_folder).name`.
+- **Decision worth knowing — auto-role assignment:** the wizard
+  intentionally does NOT ask "which one is the sow?" The role is
+  inferred from each yaml's `multianimalproject: true/false` flag.
+  If a user mis-curates their yamls (e.g. both single-animal), the
+  scorer-match check fires only if they share a scorer; otherwise
+  the "both configs are <kind>" rejection catches it. Two single
+  yamls with matching scorers but different skeletons would still
+  get rejected on the kind-mismatch rule, which is the right thing.
+- **Decision worth knowing — `_config_yaml` is also set in dual mode**
+  (to the sow yaml path) at `validatePage()` line 969. This is so
+  `_DLCFolderPage`'s Browse default still works without a special
+  case — the folder page never asks "single or dual?". Side effect:
+  `provenance["config_yaml"]` is NOT written in dual mode (the
+  dual-only `sow_config_yaml` / `piglet_config_yaml` keys are
+  written instead, at `commands.py:1096-1100`).
+- **What `_DLCMetadataPage` used to do, and why it's gone:** earlier
+  in Phase 2 the wizard had a 3-page flow (yaml → metadata → folder).
+  Sometime between T6 and T13 the metadata page was dropped — the
+  dataset name is now derived automatically from the image folder
+  basename (`Path(image_folder).name`). Same end result, one less
+  click. If a future task needs explicit dataset input back, the
+  hook is `commands.py:1093`.
+
+## T14. Positional skeleton assignment in `NewInstance`
+
+- **Status:** ✅ done — implemented as part of the dual-mode rollout;
+  user-accepted alongside T15 during the dual-mode labeling test.
+- **What's in code (`workspace/sleap/sleap/gui/commands.py:4683-4693`):**
+  Inside `AddInstance.do_action`, after the existing `n_user` /
+  `max_instances` cap computation from T6e, an `is_dual` branch:
+  ```python
+  is_dual = (
+      context.labels.provenance.get("mode") == "dlc_dual"
+      and len(context.labels.skeletons) >= 2
+  )
+  if is_dual:
+      target_skeleton = (
+          context.labels.skeletons[0] if n_user == 0
+          else context.labels.skeletons[1]
+      )
+      max_instances = 1 + len(context.labels.tracks)
+  ```
+  Legacy `mode == "dlc"` / absent → `target_skeleton = skeletons[0]`
+  and `max_instances = max(1, len(tracks))` — fully backward-compatible
+  with T6e.
+- **Invariant enforced:** dual cap = `1 + len(tracks)` (e.g. 14 for the
+  multi project: 1 sow + 13 piglets). The 15th `1`-keypress is rejected
+  with the same status-bar message wording as T6e.
+- **Decision worth knowing — positional, not user-toggled:** there is
+  no "active skeleton" radio button or skeleton picker. Labelers just
+  press `1`; the Nth press creates an instance from the Nth skeleton
+  (1st → sow, 2nd+ → piglet). This is the user's explicit choice from
+  the 2026-05-12 dual-mode design session — keypoint-only attention,
+  no extra mental state. Cost: the "missing sow" case requires the
+  user to press `1` once and place no points (empty placeholder)
+  before piglets, preserving the "1st = sow" invariant.
+- **Cap composition with bulk-copy (`2`):** `add_all_instances_copying_prior_frame`
+  in `app.py` loops `commands.newInstance`. The gate fires per
+  iteration, so a prior frame with 14 user instances bulk-copying to
+  an empty frame produces exactly 14 instances (1 sow + 13 piglets),
+  not more.
+
+## T15. DLC Image Frames dock — `sow_pts` + `piglet_pts` columns
+
+- **Status:** ✅ done — user-accepted during the dual-mode labeling test.
+- **What's in code (`workspace/sleap/sleap/gui/dataviews.py`):**
+  - Module constants: `_DLC_SINGLE_COLUMNS = ("frame", "image",
+    "points", "labeled")` and `_DLC_DUAL_COLUMNS = ("frame", "image",
+    "sow_pts", "piglet_pts", "labeled")` at `dataviews.py:691`.
+  - `_dlc_dual_denominators(labels) -> (n_sow_nodes, n_piglet_total)`
+    where `n_piglet_total = n_piglet_nodes * max(1, len(tracks))`.
+  - `_dlc_dual_counts(labeled_frame) -> (sow_visible, piglet_visible)`
+    sums `np.isfinite(inst.numpy()).all(axis=1)` across instances
+    grouped by `inst.skeleton is skeletons[0|1]`.
+  - `DLCFramesTableModel.properties` is set dynamically based on
+    `labels.provenance["mode"]` at `object_to_items` time, so opening
+    a single-yaml `.slp` still gets the 4-column layout from T6b/T6c.
+  - `update_row_for_frame` covers both column shapes — emits a single
+    `dataChanged` spanning all derived columns to preserve scroll
+    position.
+- **`labeled` semantics in dual mode (strict — was a design call):**
+  the column flips to `1` only when BOTH `sow_visible >= 2` AND
+  `piglet_visible >= 2`. Rationale recorded in TASKS.md T15: "dual
+  mode's whole purpose is both models get data per frame". The
+  one-line `or` swap is documented in `_dlc_dual_labeled_value` if
+  this turns out to bite in production.
+- **Worth knowing — `sow_pts = "—/4"` when no sow instance exists:**
+  empty-sow rows render the em-dash to distinguish "no instance yet"
+  from "0 of 4 points placed". The CSV exporter does not see this
+  affordance — it treats both as empty x/y cells (correct, matches
+  MUST_KNOW §3A).
+- **Open follow-up:** T15's strict `labeled` rule will mark every
+  piglet-only frame as `0`. Revisit during T18 if the multi-animal
+  smoke test shows lots of frames where the sow is genuinely absent
+  for stretches.
+
+## T16. Per-skeleton viewer color + show/hide toggle
+
+- **Status:** ✅ done — user-accepted (cyan against pig fur is
+  clearly distinguishable; toggles work).
+- **What's in code:**
+  - `workspace/sleap/sleap/gui/color.py:271-282` — `ColorManager`'s
+    color lookup gets a dual-mode short-circuit: if the project is
+    `dlc_dual` and the parent skeleton is `skeletons[0]`, return
+    `(0, 255, 255)` cyan. Piglets fall through to the existing
+    per-track palette. Predicted instances skip this branch (they
+    still use the prediction color above).
+  - `workspace/sleap/sleap/gui/widgets/docks.py:650-706` —
+    `DLCFramesDock.lay_everything_out` adds two `QCheckBox`es
+    ("Show sow", "Show piglets"). They live in `_toggle_widget`,
+    `setVisible(False)` by default. `_on_video_changed` re-runs
+    `_is_dual_project()` and flips the visibility — so the toggles
+    appear ONLY when the loaded project is dual mode. Single-yaml
+    projects never see them.
+  - Toggles call `self.main_window.player.setSkeletonVisible(
+    skeleton, checked)` to update the viewer; rendering changes
+    only, no effect on points columns or `NewInstance` cap.
+- **Decision worth knowing — cyan over white:** TASKS.md proposed
+  bright white. During implementation, white was rejected because
+  the sow is light-pink/cream; cyan `(0,255,255)` provides higher
+  contrast against both the animal and typical farm-camera
+  lighting. Single-value constant; easy to swap if a labeler
+  finds it harsh.
+- **Open follow-up:** `setSkeletonVisible` is a new player method;
+  if anyone refactors `widgets/video.py`'s rendering pipeline,
+  preserve the per-skeleton visibility dict on the player. Tests
+  rely on it being a simple `{skel_id: bool}` lookup.
+
+## T17. Export — two CSVs in dual mode
+
+- **Status:** ✅ done — 2026-05-28 (user-accepted after the
+  status-bar overflow + auto-open-folder polish below).
+- **What's in code (`workspace/sleap/sleap/gui/commands.py:1261-1396`,
+  `workspace/sleap/sleap/io/format/dlc_csv.py`):**
+  - `ExportDLCCSV.do_action` branches on `mode`. Dual path resolves
+    output dirs from provenance:
+    - Sow: `<dirname(sow_config_yaml)>/labeled-data/<basename(image_folder)>/`
+    - Piglet: `<dirname(piglet_config_yaml)>/labeled-data/<basename(image_folder)>/`
+    Both directories are auto-created (`mkdir(parents=True,
+    exist_ok=True)`); CSVs are written via two `DLCCSVAdaptor.write`
+    calls — one with `skeleton=skeletons[0]`, `is_multi=False`,
+    `instance_slice=slice(0,1)`; the other with `skeletons[1]`,
+    `is_multi=True`, `instance_slice=slice(1, None)`.
+  - `DLCCSVAdaptor.write` was extended (during T17 implementation,
+    not T10) to accept `skeleton` and `instance_slice` arguments so
+    one adaptor function handles both sow-slice and piglet-slice
+    writes without code duplication.
+  - **All-or-nothing overwrite prompt:** the dual path checks both
+    output paths for existence in a single pass. If either exists,
+    one `QMessageBox.question` lists ALL pre-existing files and
+    asks Yes/No. No → cancel both writes (no partial export). Yes
+    → both files overwritten.
+- **Status-bar UX (2026-05-28 polish):**
+  - Status bar message kept short: `"Exported N DLC CSV(s) —
+    opening folder(s)."` (or "no user instances to write" if both
+    halves skipped). The previous version concatenated both
+    absolute paths and overran the bar at the 13pt-bold font set
+    by the T7 follow-up.
+  - New helper `_open_in_file_manager(folder_path)` at
+    `commands.py` just above `ExportDLCCSV` — wraps
+    `QtGui.QDesktopServices.openUrl(QUrl.fromLocalFile(...))`.
+    Cross-platform (Windows Explorer, macOS Finder, Linux file
+    managers). The single-mode export reuses the same helper.
+  - Dual mode opens BOTH folders (two Explorer windows). User
+    decision from 2026-05-28: the sow and piglet CSVs live in
+    different parent DLC projects on disk, and the labeler
+    uploads from both, so popping both is more useful than
+    popping one and forcing manual navigation to the other.
+- **No GUI changes needed for the legacy single-yaml path** — it
+  goes through the same `ExportDLCCSV` command with `mode == "dlc"`,
+  unchanged behavior aside from the new auto-open folder side
+  effect.
+- **Open follow-up — float-precision quirk inherited from T10:**
+  the multi-CSV header parser in pandas can lose 1 ULP on certain
+  17-digit floats. The adaptor itself preserves bits; downstream
+  DLC reads via the same lossy default parser, so it cancels out.
+  See T10 entry for full reproduction notes.
+
+## Handoff — what's left and what to watch
+
+### T18 is the only remaining task
+
+- **Verification-only.** Run the full dual-mode flow end-to-end on
+  `sleap_label/single/ch07_Crate08_..._00h15m00s/` (or whichever
+  folder has both sow and piglets visible across most frames),
+  then upload BOTH CSVs to the Linux server and run, per project:
+  ```bash
+  python 2_create_project/csv_to_h5_official.py
+  python 2_create_project/check_labels_from_sleap.py
+  ```
+  Both must exit 0 for both DLC projects (sow + piglet).
+- **Empty-sow placeholder check:** T18 explicitly includes the
+  "sow not present" frame test — press `1` once with NO keypoints
+  placed, then add piglets. The sow CSV row for that frame should
+  have all-empty x/y cells; piglet CSV row should have its filled
+  cells. The server's `check_labels_from_sleap.py` should still
+  exit 0 — confirming the empty placeholder is tolerated as
+  intended (per MUST_KNOW §3A occluded-cells rule).
+- **Strict `labeled` decision:** during T18, if multiple frames
+  legitimately have no visible sow, decide whether to switch
+  T15's `labeled` predicate to lenient (`or`). One-line change;
+  documented inline in `dataviews.py`.
+
+### Documentation drift worth fixing in a follow-up
+
+- **`docs/MUST_KNOW.md §2`** — multi-animal `skeleton:` shape was
+  amended verbally during T5 (it's `[[[a,b],[c,d]]]` with an outer
+  wrap in real configs, not flat as the spec shows). The wizard
+  parser handles both, but the doc still shows the flat form.
+- **`docs/MUST_KNOW.md §3A`** — the diagram shows a 3-cell leading
+  index column; real reference CSVs (and our export) use a single
+  combined-path index, matching pandas `to_csv()`'s default for a
+  3-level column MultiIndex. Update the diagram or note the gap.
+
+### Code conventions established by Phase 6 work
+
+- **Mode dispatch is via `labels.provenance.get("mode")`,
+  string-compared to `"dlc"` / `"dlc_dual"`.** No isinstance checks,
+  no skeleton-count inference. Keeps the fork in single source of
+  truth and greppable. If a future Phase 7 adds a third mode
+  (e.g. predictions-only review), add the string here and branch
+  the same way.
+- **Per-skeleton positional rules** are the design pattern (T14,
+  T15, T17 export slicing). `skeletons[0]` is canonical sow,
+  `skeletons[1]` is canonical piglet. Anything that walks
+  `lf.user_instances` for dual mode should index by position
+  through the same `skeletons[0|1]` lookup, not by name or by
+  `instance.track`.
+- **Backward compatibility with single-yaml `.slp` files is
+  preserved by every Phase 6 site.** Every dual-mode branch
+  guards on `mode == "dlc_dual" AND len(labels.skeletons) >= 2`
+  so legacy projects with a single skeleton stay on the old
+  code path. Don't drop the length check — it protects against
+  half-built projects that somehow have `dlc_dual` mode but only
+  one skeleton (shouldn't happen, but cheap to guard).
+
+## Phase 7 — Frame-level environment labels (lying / heat_lamp / food)
+
+Implemented on branch `frame-env-labels` (2026-05-28). Design:
+`docs/superpowers/specs/2026-05-28-frame-environment-labels-design.md`.
+Three per-image scalar labels independent of any keypoint, edited via
+dropdowns in the DLC Image Frames dock, carried forward by `2`, persisted
+in the `.slp`, and exported to a separate plain CSV.
+
+### T19. Frame-label dropdown columns + `SetFrameLabel` command + persistence
+
+- **Status:** ✅ implemented + headless-tested 2026-05-28 (manual GUI
+  verification pending).
+- **Tokens (space-free, stored & in CSV) vs dropdown display:**
+  `lying` up/down/none; `heat_lamp` on/off/`not_clear` (shows "not clear");
+  `food` 3/2/1/0 (shows "3 — very much" … "0 — none"). Unset = `""`,
+  cell shows `—`, exports blank. Friendly text is display-only via
+  `QComboBox` itemData(token)/itemText(display).
+- **Storage:** `labels.provenance["frame_labels"]`, dict keyed by
+  `str(frame_idx)`, only set fields stored; clearing a field prunes it and
+  an emptied per-frame dict is pruned. Keyed by index (not filename) to
+  match `LabeledFrame` keying and survive T12 append-only sync.
+- **Persistence verified:** headless `sio.save_file → load_file` preserves
+  `provenance["frame_labels"]` exactly — it rides the same `metadata/json`
+  HDF5 attr the keypoints' provenance uses (`slp.py:write_metadata`
+  `json.dumps`, `read_metadata` `json.loads`). **No extra save path; no
+  rework on reopen** (the user's explicit requirement).
+- **Changes:**
+  - `dataviews.py` — `FRAME_LABEL_FIELDS`, `FRAME_LABEL_OPTIONS`,
+    `_FRAME_LABEL_HEADERS`, `_frame_label_cell_text`; the three columns added
+    to `_DLC_SINGLE_COLUMNS` and `_DLC_DUAL_COLUMNS` (before `labeled`);
+    `object_to_items` populates cells from provenance; `DLCFramesTableModel`
+    overrides `data` (Display=friendly, Edit=token), `headerData`
+    ("Heat Lamp"), `can_set`/`set_item` (route to `setFrameLabel`), and a
+    `refresh_frame_label_cells` helper for programmatic updates.
+  - `commands.py` — `SetFrameLabel(AppCommand)` with `does_edits=True`
+    (subclasses `AppCommand` not `EditCommand` to avoid a forward reference —
+    `EditCommand` is defined ~1900 lines later; `does_edits=True` gives the
+    same dirty-tracking via `do_with_signal`). `topics=[]` so no scene
+    redraw. New `CommandContext.setFrameLabel(frame_idx, field, value)`.
+  - `widgets/docks.py` — `FrameLabelDelegate(QStyledItemDelegate)`: one
+    delegate for all three columns, adapts to the current `properties`
+    (single vs dual layout), no-ops for other columns; commits on
+    `activated` (one-click feel). Installed in `DLCFramesDock.create_tables`
+    with edit triggers `DoubleClicked | SelectedClicked | EditKeyPressed`.
+- **Note — no functional undo in this fork.** `changestack` only tracks the
+  unsaved-changes flag (see its comment in `commands.py`). The dirty flag,
+  not undo, is what makes Save persist the labels.
+- **Headless smoke tests (QT_QPA_PLATFORM=offscreen):** all PASS.
+  - Fresh model → 7 single-mode columns incl. lying/heat_lamp/food; all `—`.
+  - Header for `heat_lamp` renders "Heat Lamp".
+  - `setData` stores tokens, displays friendly text; food cell stays numeric.
+  - Provenance keyed by `str(idx)`; clearing prunes field then frame; dirty
+    flag set.
+  - `save_file → load_file` round-trip preserves `frame_labels`.
+  - Non-DLC (str filename) video → empty model, no crash.
+- **Pending manual verification:**
+  1. Open sow project → dock shows `lying | heat lamp | food`; click a cell →
+     dropdown opens; pick a value → cell updates; title shows unsaved (*).
+  2. Set values on ≥3 frames → Ctrl+S → close → reopen → same values shown.
+  3. `food=0` shows `0` (not blank); untouched frame shows `—`.
+  4. Dual project → columns appear before `labeled`; same editing.
+
+### T20. Carry the three labels on "Copy Prior Frame" (`2`)
+
+- **Status:** ✅ implemented 2026-05-28 (manual GUI verification pending).
+- **Change (`app.py` `add_all_instances_copying_prior_frame`):** after the
+  instance-copy loop, read the prior labeled frame's
+  `provenance["frame_labels"][str(prev_idx)]` and, for each **set** field,
+  call `commands.setFrameLabel(...)` on the current frame; then
+  `dlc_frames_dock.model.refresh_frame_label_cells(...)`. Runs even when
+  `n_to_copy == 0`. Fields unset in the prior frame are left untouched
+  (no clobber). Imports `FRAME_LABEL_FIELDS` from `dataviews`.
+- **Known limitation:** the label source is the prior *labeled* frame
+  (`AddInstance.get_previous_frame_index`), so a prior frame that has
+  dropdowns set but no keypoint instances would be skipped. Acceptable —
+  the workflow labels keypoints on every frame. Revisit if needed.
+- **Pending manual verification:** set labels on frame N → `2` on N+1 carries
+  them (plus keypoints); override on N+1 → `2` on N+2 carries N+1's values;
+  works when N+1 already has its instances.
+
+### T21. Export `FrameLabels_<scorer>.csv` (folded into Export DLC CSV)
+
+- **Status:** ✅ implemented + headless-tested 2026-05-28 (manual GUI
+  verification pending).
+- **New `io/format/frame_labels_csv.py`** — `write_frame_labels_csv(filename,
+  labels, video)`: plain CSV, header `image,lying,heat_lamp,food`, one row per
+  image in `video.filename` order, unset → blank cell. Defines its own
+  `FRAME_LABEL_FIELDS` so the IO layer has no GUI dependency. Returns `False`
+  for non-image-backed videos.
+- **Wired into `ExportDLCCSV.do_action`:** writes `FrameLabels_<scorer>.csv`
+  into `provenance["image_folder"]` in BOTH single and dual mode (one file in
+  the shared image folder — not duplicated into the two dual project dirs).
+  Folded into the existing overwrite-confirm (the FrameLabels path is added to
+  the existing-files check, so still one prompt). The no-keypoints early-return
+  was changed to still write the frame-labels CSV (it is independent of
+  keypoints) before returning.
+- **Headless smoke tests (QT_QPA_PLATFORM=offscreen):** all PASS.
+  - Writer: header + one row per image; unset → blanks; `not_clear`/`3`/`none`
+    tokens space-free; `food=0` distinct from blank; non-image video → False.
+  - End-to-end `ExportDLCCSV` on a real `ImageVideo` (3 PNGs) + 1 user
+    instance + frame labels → both `CollectedData_jiale.csv` (unchanged 3-row
+    DLC header) and `FrameLabels_jiale.csv` written with expected rows.
+  - No-keypoints project → only `FrameLabels_jiale.csv` written; `food=0`
+    preserved.
+- **Pending manual verification:** File → Export DLC CSV writes both files
+  next to each other (single) / FrameLabels in the shared image folder (dual);
+  re-export → single overwrite prompt lists both.
+
+### T22. End-to-end smoke test — frame labels
+
+- **Status:** ⬜ headless portions done (folded into T19/T21 above); the full
+  manual GUI flow (label → set dropdowns → `2` carry → save/reload → export,
+  single + dual) is pending the user's interactive run. No server-side step —
+  the frame-labels CSV is downstream research data, not consumed by
+  `csv_to_h5_official.py`.
+
+### Phase 7 — guidance for the next implementer
+
+- **Frame-level labels live ONLY in `labels.provenance["frame_labels"]`**
+  (keyed by `str(frame_idx)`), never on `Instance`/`LabeledFrame` (sleap_io
+  has no per-frame metadata field and we can't patch the dependency). The
+  provenance JSON is the single round-tripping home.
+- **Tokens are space-free and canonical;** display strings are derived in
+  `dataviews._frame_label_cell_text` / `FRAME_LABEL_OPTIONS` and in the
+  delegate. If you add a value, add it in `FRAME_LABEL_OPTIONS` (GUI) AND keep
+  `frame_labels_csv.FRAME_LABEL_FIELDS` in sync (two deliberate copies — GUI
+  vs IO — to avoid a GUI→IO import).
+- **The DLC dock column layout is mode-driven** (`_DLC_SINGLE_COLUMNS` /
+  `_DLC_DUAL_COLUMNS`); the delegate keys off `model.properties[col]` by
+  name, so column position can move freely between layouts.

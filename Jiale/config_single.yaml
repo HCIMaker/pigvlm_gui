@@ -1,0 +1,54 @@
+SuperAnimalConversionTables: null
+Task: Smoke_single
+TrainingFraction:
+- 0.95
+alphavalue: 0.7
+batch_size: 8
+bodyparts:
+- nose
+- left_ear
+- right_ear
+- torso
+- hip
+colormap: rainbow
+corner2move2:
+- 50
+- 50
+cropping: false
+date: May28
+default_augmenter: default
+default_net_type: resnet_50
+detector_batch_size: 1
+detector_snapshotindex: -1
+dotsize: 12
+engine: pytorch
+identity: null
+iteration: 0
+move2corner: true
+multianimalproject: false
+numframes2pick: 300
+pcutoff: 0.6
+project_path: /home/jiale/Jiale_Research/PigVLM/PigFarmDataProcessing/deeplabcut/Smoke_single-jiale-2026-05-28/splits/Jiale
+scorer: Jiale
+skeleton:
+- - nose
+  - left_ear
+- - nose
+  - right_ear
+- - left_ear
+  - torso
+- - right_ear
+  - torso
+- - torso
+  - hip
+skeleton_color: black
+snapshotindex: -1
+start: 0
+stop: 1
+video_sets:
+  ? /home/jiale/Jiale_Research/PigVLM/PigFarmDataProcessing/deeplabcut/1_data_curation/smoke_clip/ch07_Crate08_20220506070000_20220506090000_clip_01h00m00s.mp4
+  : crop: 0, 1100, 0, 800
+x1: 0
+x2: 640
+y1: 277
+y2: 624

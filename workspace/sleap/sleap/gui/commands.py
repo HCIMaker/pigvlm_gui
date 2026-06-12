@@ -324,6 +324,10 @@ class CommandContext:
         """Append new images on disk into the project's frozen image list."""
         self.execute(SyncDLCImageFolder)
 
+    def setFrameLabel(self, frame_idx: int, field: str, value: str):
+        """Set a frame-level environment label (T19): lying/heat_lamp/food."""
+        self.execute(SetFrameLabel, frame_idx=frame_idx, field=field, value=value)
+
     def exportDLCCSV(self):
         """Export a DLC CollectedData_<scorer>.csv for the current DLC project."""
         self.execute(ExportDLCCSV)
@@ -1142,7 +1146,12 @@ class SyncDLCImageFolder(AppCommand):
     remain bound to the correct images.
     """
 
-    topics = [UpdateTopic.video, UpdateTopic.frame]
+    # Empty topics on purpose: we refresh the player + DLC dock manually inside
+    # do_action. If we left topics=[UpdateTopic.video, UpdateTopic.frame], the
+    # post-action signal_update cascade fires plotFrame → updateStatusMessage,
+    # which overwrites our success message and (per user report 2026-05-XX) the
+    # seekbar bounds end up out of sync with the mutated video's new length.
+    topics: List[UpdateTopic] = []
 
     @staticmethod
     def do_action(context: CommandContext, params: dict):
@@ -1210,16 +1219,58 @@ class SyncDLCImageFolder(AppCommand):
         merged_paths = existing_paths + new_paths
         video.replace_filename(merged_paths, open=True)
 
-        # Mutating an existing Video in place leaves state["video"] identity-
-        # equal, so DLCFramesDock's connect callback won't fire. Explicit
-        # emit forces the dock to re-run object_to_items on the longer list.
-        # Mirrors the pattern used by ReplaceVideo.do_action.
+        # Force the player to recompute seekbar bounds against the new length
+        # and replot the current frame. state.emit("video") alone is not
+        # reliable here: in practice W/S navigation and double-click on new
+        # rows kept stopping at the old last frame until the project was
+        # saved+reopened. Calling load_video directly bypasses any emit-chain
+        # timing issue and matches what save+reopen does internally.
+        player = getattr(context.app, "player", None)
+        if player is not None:
+            # The player runs frame reads on a worker thread that caches a
+            # `deepcopy(video)` and refreshes it ONLY when
+            # `self.current_video is not video` (identity check — see
+            # `widgets/video_worker.py:142`). Our in-place
+            # `replace_filename` keeps the Video object identity equal, so
+            # without this reset the worker keeps reading from a frozen
+            # snapshot of the OLD filename list and the new frames render as
+            # blank / fail to load — which is exactly the post-sync symptom
+            # that goes away after save+reopen. Reset current_video to None
+            # so the next request_frame triggers a fresh deepcopy.
+            worker = getattr(player, "worker_thread", None)
+            if worker is not None:
+                worker.current_video = None
+                worker.local_video_copy = None
+            player.load_video(video)
+
+        # DLCFramesDock listens via state.connect("video", _on_video_changed);
+        # mutating the Video in place leaves state["video"] identity-equal, so
+        # we emit explicitly to make the dock re-run object_to_items against
+        # the longer filename list.
         context.state.emit("video")
+
+        # Repaint seekbar marks (user-labeled, suggestions) against the now-
+        # wider seekbar. Cheap; no-op for non-DLC projects.
+        update_marks = getattr(context.app, "_update_seekbar_marks", None)
+        if callable(update_marks):
+            update_marks()
+
         context.changestack_push("sync dlc image folder")
         _status(
             f"Sync DLC image folder: added {len(new_paths)} new image(s) "
             f"(was {len(existing_paths)}, now {len(merged_paths)})."
         )
+
+
+def _open_in_file_manager(folder_path) -> None:
+    """Open `folder_path` in the OS file manager (Explorer/Finder/etc.).
+
+    Uses Qt's `QDesktopServices.openUrl` so it works on Windows, macOS,
+    and Linux without a per-OS branch. Silently no-ops if Qt can't open
+    the URL (e.g. headless test runs).
+    """
+    url = QtCore.QUrl.fromLocalFile(str(folder_path))
+    QtGui.QDesktopServices.openUrl(url)
 
 
 class ExportDLCCSV(AppCommand):
@@ -1272,14 +1323,32 @@ class ExportDLCCSV(AppCommand):
             _status("Export DLC CSV: no video in project.")
             return
 
+        # T21: the frame-level environment-labels CSV is written alongside the
+        # keypoint CSV(s), into the (shared) image folder in both single and
+        # dual mode. Plain, space-free CSV — see io/format/frame_labels_csv.py.
+        from sleap.io.format.frame_labels_csv import write_frame_labels_csv
+
+        fl_path = folder / f"FrameLabels_{scorer}.csv"
+
+        def _write_frame_labels():
+            return write_frame_labels_csv(str(fl_path), labels, video)
+
         has_user_labels = any(
             any(not inst.from_predicted for inst in lf.instances)
             for lf in labels.find(video)
         )
         if not has_user_labels:
-            _status(
-                "Export DLC CSV: no labeled frames in video — nothing to export."
-            )
+            # Frame labels are independent of keypoints — still export them.
+            if _write_frame_labels():
+                _status(
+                    f"Export DLC CSV: no keypoint labels; wrote frame labels "
+                    f"to {fl_path}."
+                )
+            else:
+                _status(
+                    "Export DLC CSV: no labeled frames in video — nothing to "
+                    "export."
+                )
             return
 
         if mode == "dlc_dual" and len(labels.skeletons) >= 2:
@@ -1312,7 +1381,11 @@ class ExportDLCCSV(AppCommand):
 
             existing = [
                 (role, p)
-                for role, p in (("sow", sow_out_path), ("piglet", piglet_out_path))
+                for role, p in (
+                    ("sow", sow_out_path),
+                    ("piglet", piglet_out_path),
+                    ("frame labels", fl_path),
+                )
                 if p.exists()
             ]
             if existing:
@@ -1348,13 +1421,17 @@ class ExportDLCCSV(AppCommand):
                 is_multi=True,
                 instance_slice=slice(1, None),
             )
-            msg_parts = []
-            if sow_wrote:
-                msg_parts.append(f"sow → {sow_out_path}")
-            if piglet_wrote:
-                msg_parts.append(f"piglet → {piglet_out_path}")
-            if msg_parts:
-                _status("Exported DLC CSVs: " + "; ".join(msg_parts))
+            _write_frame_labels()  # one FrameLabels CSV in the shared image folder
+            wrote_count = int(bool(sow_wrote)) + int(bool(piglet_wrote))
+            if wrote_count:
+                _status(
+                    f"Exported {wrote_count} DLC CSV(s) + frame labels — "
+                    f"opening folder(s)."
+                )
+                if sow_wrote:
+                    _open_in_file_manager(sow_out_dir)
+                if piglet_wrote:
+                    _open_in_file_manager(piglet_out_dir)
             else:
                 _status("Export DLC CSV: no user instances to write.")
             return
@@ -1362,15 +1439,17 @@ class ExportDLCCSV(AppCommand):
         # Single-config (legacy) path.
         out_path = folder / f"CollectedData_{scorer}.csv"
 
-        if out_path.exists():
+        existing = [p for p in (out_path, fl_path) if p.exists()]
+        if existing:
+            names = "\n".join(str(p) for p in existing)
             reply = QtWidgets.QMessageBox.question(
                 context.app,
                 "Overwrite DLC CSV?",
-                f"{out_path.name} already exists in\n{folder}\n\nOverwrite?",
+                f"The following file(s) already exist:\n\n{names}\n\nOverwrite?",
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
             )
             if reply != QtWidgets.QMessageBox.Yes:
-                _status(f"Export DLC CSV: canceled (file exists): {out_path}")
+                _status("Export DLC CSV: canceled (existing files).")
                 return
 
         wrote = DLCCSVAdaptor.write(
@@ -1380,13 +1459,49 @@ class ExportDLCCSV(AppCommand):
             scorer=scorer,
             folder_name=folder.name,
         )
+        _write_frame_labels()
         if wrote:
-            _status(f"Exported DLC CSV: {out_path}")
+            _status("Exported DLC CSV + frame labels — opening folder.")
+            _open_in_file_manager(folder)
         else:
             _status(
                 f"Export DLC CSV: no labeled frames in video — nothing to "
                 f"write to {out_path}."
             )
+
+
+class SetFrameLabel(AppCommand):
+    """Set/clear a frame-level environment label (T19, Phase 7).
+
+    Stores into ``labels.provenance["frame_labels"][str(frame_idx)][field]``.
+    An empty value clears the field; an emptied per-frame dict is pruned.
+    ``does_edits = True`` marks the project dirty so the next save persists it —
+    the nested dict round-trips through the ``.slp`` via provenance JSON (the
+    same store the keypoint labels live in), so reopening restores the labels
+    with no rework. No ``topics``: the DLC Image Frames dock repaints the edited
+    cell itself (via its ``setData`` / ``refresh_frame_label_cells``), and no
+    scene redraw is needed.
+    """
+
+    does_edits = True
+
+    @staticmethod
+    def do_action(context: CommandContext, params: dict):
+        frame_idx = params["frame_idx"]
+        field = params["field"]
+        value = params.get("value") or ""
+
+        frame_labels = context.labels.provenance.setdefault("frame_labels", {})
+        key = str(frame_idx)
+        entry = frame_labels.get(key, {})
+        if value:
+            entry[field] = value
+        else:
+            entry.pop(field, None)
+        if entry:
+            frame_labels[key] = entry
+        else:
+            frame_labels.pop(key, None)
 
 
 class LoadLabelsObject(AppCommand):

@@ -1,0 +1,62 @@
+SuperAnimalConversionTables: null
+Task: Smoke_multi
+TrainingFraction:
+- 0.95
+alphavalue: 0.7
+batch_size: 8
+bodyparts: MULTI!
+colormap: rainbow
+corner2move2:
+- 50
+- 50
+cropping: false
+date: May28
+default_augmenter: albumentations
+default_net_type: resnet_50
+default_track_method: ellipse
+detector_batch_size: 1
+detector_snapshotindex: -1
+dotsize: 12
+engine: pytorch
+identity: false
+individuals:
+- piglet1
+- piglet2
+- piglet3
+- piglet4
+- piglet5
+- piglet6
+- piglet7
+- piglet8
+- piglet9
+- piglet10
+- piglet11
+- piglet12
+iteration: 0
+move2corner: true
+multianimalbodyparts:
+- nose
+- torso
+- hip
+multianimalproject: true
+numframes2pick: 300
+pcutoff: 0.6
+project_path: /home/jiale/Jiale_Research/PigVLM/PigFarmDataProcessing/deeplabcut/Smoke_multi-jiale-2026-05-28/splits/Jiale
+scorer: Jiale
+skeleton:
+- - nose
+  - torso
+- - torso
+  - hip
+skeleton_color: black
+snapshotindex: -1
+start: 0
+stop: 1
+uniquebodyparts: []
+video_sets:
+  ? /home/jiale/Jiale_Research/PigVLM/PigFarmDataProcessing/deeplabcut/1_data_curation/smoke_clip/ch07_Crate08_20220506070000_20220506090000_clip_01h00m00s.mp4
+  : crop: 0, 1100, 0, 800
+x1: 0
+x2: 640
+y1: 277
+y2: 624

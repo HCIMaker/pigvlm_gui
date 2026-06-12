@@ -441,7 +441,7 @@ wizard; DLC Image Frames dock already present from the T6 follow-up).
 
 ## Phase 5 — Maintenance
 
-### T12. Sync DLC image folder (append-only, on-demand) 🔵
+### T12. Sync DLC image folder (append-only, on-demand) ✅
 - **Depends on:** T6
 - **Background:** When the wizard finishes, `Video.from_filename(folder)`
   expands the folder to a frozen `list[str]` of paths and stores it in the
@@ -602,7 +602,7 @@ each project folder independently.
    `mode == "dlc"` and the old single-skeleton behavior. Nothing about
    T6a–T12 changes for those projects.
 
-### T13. Wizard — "pair with second config" checkbox + dual-yaml parse ⬜
+### T13. Wizard — "pair with second config" checkbox + dual-yaml parse ✅
 - **Depends on:** T5, T6, T12
 - **Do:**
   1. In `_DLCYamlPage` (`workspace/sleap/sleap/gui/commands.py:818`), add
@@ -655,7 +655,7 @@ each project folder independently.
   - Pick yamls whose `scorer:` differs → status label says "scorer
     mismatch (<a> vs <b>)"; Next stays disabled.
 
-### T14. Positional skeleton assignment in `NewInstance` ⬜
+### T14. Positional skeleton assignment in `NewInstance` ✅
 - **Depends on:** T13, T6e
 - **Context:** T6e already gates `NewInstance.do_action`
   (`commands.py:613`) on `n_user >= max_instances`, with
@@ -691,7 +691,7 @@ each project folder independently.
   - Prediction-only instances do not consume the user budget
     (preserve T6e invariant).
 
-### T15. DLC Image Frames dock — `sow_pts` + `piglet_pts` columns ⬜
+### T15. DLC Image Frames dock — `sow_pts` + `piglet_pts` columns ✅
 - **Depends on:** T13, T6b, T6c
 - **Do:**
   1. In `DLCFramesTableModel` (`workspace/sleap/sleap/gui/dataviews.py:677`),
@@ -727,7 +727,7 @@ each project folder independently.
     rest empty → `piglet_pts = 2/39`, `labeled = 1` (both ≥2).
   - Single-yaml project unchanged: 4-column layout from T6b/T6c.
 
-### T16. Per-skeleton viewer color + show/hide toggle ⬜
+### T16. Per-skeleton viewer color + show/hide toggle ✅
 - **Depends on:** T13
 - **Do:**
   1. In the viewer (search `sleap/gui/widgets/video.py` for instance/edge
@@ -760,7 +760,7 @@ each project folder independently.
     appear but have no visible effect (only one skeleton exists).
   - Cap and column behavior unchanged when toggles flip.
 
-### T17. Export — two CSVs in dual mode ⬜
+### T17. Export — two CSVs in dual mode ✅
 - **Depends on:** T13, T7, T10, T14
 - **Do:**
   1. In `ExportDLCCSV.do_action` (`commands.py`, near the existing T7/T10
@@ -834,3 +834,149 @@ each project folder independently.
   `docs/PROGRESS.md` captures the command outputs for both projects.
   Decision recorded on whether to keep strict or switch to lenient
   `labeled` semantics (T15) based on the workflow feel.
+
+## Phase 7 — Frame-level environment labels (lying direction, heat lamp, food)
+
+**Motivation (2026-05-28 session):** beyond per-keypoint annotation, the
+research needs three **general, frame-level** observations per image that are
+not tied to any keypoint or skeleton — they describe the scene. The labeler
+sets them from dropdowns in the DLC Image Frames dock, they carry forward from
+the prior frame, persist in the `.slp` like keypoints, and export to a separate
+CSV. Full design: `docs/superpowers/specs/2026-05-28-frame-environment-labels-design.md`.
+
+**Pre-decided facts (2026-05-28 session with user):**
+1. **The three labels and their space-free CSV/stored tokens** (dropdown may
+   show friendlier text; what is stored in the `.slp` and written to CSV is
+   always the no-space token):
+   - `lying` (sow lying direction): `up` / `down` / `none` (`none` = not
+     lying / unclear).
+   - `heat_lamp`: `on` / `off` / `not_clear` (dropdown displays "not clear").
+   - `food` (tank level): `3` / `2` / `1` / `0` (dropdown displays
+     "3 — very much" … "0 — none").
+2. **Unset is the default**, shown as `—`, distinct from real observations
+   (`food=0`, `heat_lamp=off`). Unset exports as an **empty cell**.
+3. **Edit UI = three inline dropdown columns** added to the DLC Image Frames
+   dock (not a separate panel). Column order — single-config:
+   `frame | image | points | lying | heat lamp | food | labeled`; dual:
+   `frame | image | sow_pts | piglet_pts | lying | heat lamp | food | labeled`.
+4. **Storage = `labels.provenance["frame_labels"]`**, a dict keyed by **string**
+   frame index holding only set fields, e.g.
+   `{"1": {"lying": "up", "heat_lamp": "on", "food": "3"}}`. Keyed by
+   `str(frame_idx)` (not filename) to match `LabeledFrame` keying and survive
+   T12's append-only sync.
+5. **Persistence is the standard `.slp` save path — no extra mechanism.**
+   Verified against installed `sleap_io` 0.6.5: `slp.py:write_metadata` does
+   `json.dumps(md)` with `md["provenance"]=labels.provenance`, and
+   `read_metadata` does `json.loads(...)`. The nested `frame_labels` dict
+   round-trips intact — same store the keypoints live in.
+6. **Copy-prior = folded into `2`** (Copy Prior Frame), not a separate action.
+7. **Export = one `FrameLabels_<scorer>.csv`, folded into Export DLC CSV.**
+   Every image gets a row (blanks for unset). Written into
+   `provenance["image_folder"]`; in dual mode, one file there (not duplicated
+   into both project dirs).
+
+### T19. Frame-label dropdown columns + `SetFrameLabel` command + persistence ✅
+- **Depends on:** T6c, T13, T15
+- **Do:**
+  1. In `workspace/sleap/sleap/gui/dataviews.py`, add the three columns to both
+     `_DLC_SINGLE_COLUMNS` and `_DLC_DUAL_COLUMNS` (before `labeled`):
+     keys `lying`, `heat_lamp`, `food`. Add a module-level mapping of each
+     column to its `(token, display)` option list (plus the `""`/`—` unset
+     default).
+  2. In `DLCFramesTableModel.object_to_items`, populate each label cell's
+     display string from `context.labels.provenance.get("frame_labels", {})`
+     keyed by `str(frame_idx)`; unset → `—`.
+  3. Override `flags()` to OR in `Qt.ItemIsEditable` for the three label
+     columns only (existing columns stay read-only).
+  4. Override `setData()` for those columns: route the new value through a new
+     `SetFrameLabel` command (below), then refresh that row's label cells
+     (reuse the single-row `dataChanged` pattern from `update_row_for_frame`).
+  5. Header display: if `GenericTableModel` shows the raw `properties` key,
+     add a `headerData` override so `heat_lamp` reads "heat lamp".
+  6. In `workspace/sleap/sleap/gui/widgets/docks.py`, add a
+     `FrameLabelDelegate(QStyledItemDelegate)` whose `createEditor` returns a
+     `QComboBox` populated from the column's option list (itemText = friendly
+     display, itemData = canonical token), `setEditorData` /`setModelData`
+     wire the combo to the model. Install it on the DLC frames table via
+     `setItemDelegateForColumn` for the three label columns in `DLCFramesDock`.
+  7. In `workspace/sleap/sleap/gui/commands.py`, add `SetFrameLabel(EditCommand)`
+     with `does_edits = True`. `do_action(params={"frame_idx","field","value"})`
+     writes `provenance["frame_labels"][str(idx)][field] = value`, pruning the
+     field when value is `""`/unset and pruning the per-frame dict when empty.
+- **Accept:**
+  - Open the sow DLC project → DLC Image Frames dock shows
+    `lying | heat lamp | food` columns; every cell starts at `—`.
+  - Click a `lying` cell → dropdown lists `— / up / down / none`; pick `up` →
+    cell shows `up`. `heat lamp` dropdown shows "not clear" but the stored
+    token is `not_clear`. `food` dropdown shows "3 — very much" but stores `3`.
+  - After any edit the project is **dirty** (Save indicates unsaved changes).
+    (This fork has no functional undo; dirty-tracking is what makes the save
+    persist the labels.)
+  - **Persistence:** set values on ≥3 frames → `Ctrl+S` → close → reopen the
+    `.slp` → the same cells show the same values. Headless test:
+    `save_file → load_file` preserves `provenance["frame_labels"]` exactly.
+  - Dual project → the three columns appear before `labeled`; same editing
+    behavior. Non-DLC (mp4-backed) `.slp` → dock empty, no label columns shown.
+
+### T20. Carry the three labels on "Copy Prior Frame" (`2`) ✅
+- **Depends on:** T19, T6d
+- **Do:** Extend `add_all_instances_copying_prior_frame` (`app.py:819`). After
+  the existing instance-copy loop, read the **prior labeled frame's**
+  `provenance["frame_labels"][str(prev_idx)]` entry and, for each **set** field,
+  execute `SetFrameLabel` to write it onto the current frame. Fields unset in
+  the prior frame are left untouched. The label copy must run **even when
+  `n_to_copy == 0`** (current frame already has its instances) so labels still
+  carry forward on a single keypress.
+- **Accept:**
+  - On frame N set `lying=up, heat_lamp=on, food=2`. Move to empty frame N+1,
+    press `2` → N+1 shows the same three values (in addition to copied
+    keypoints).
+  - On a frame that already has all its instances (so `n_to_copy == 0`),
+    pressing `2` still carries the prior frame's labels.
+  - Override `food=1` on N+1, press `2` on N+2 → N+2 inherits N+1's values
+    (`lying=up, heat_lamp=on, food=1`).
+  - Prior frame with a field unset (e.g. `heat_lamp` never set) → pressing `2`
+    leaves the current frame's `heat_lamp` unchanged (no clobber to `—`).
+  - Single-animal regression: the existing one-instance copy still works.
+
+### T21. Export `FrameLabels_<scorer>.csv` (folded into Export DLC CSV) ✅
+- **Depends on:** T19, T7, T17
+- **Do:**
+  1. New `workspace/sleap/sleap/io/format/frame_labels_csv.py` mirroring
+     `dlc_csv.py`'s shape: a `write(filename, labels, video, scorer)` that emits
+     a **plain CSV** (no multi-row header) with columns
+     `image, lying, heat_lamp, food`, **one row per image** in `video.filename`
+     order. Each value comes from `provenance["frame_labels"].get(str(idx), {})`;
+     unset fields → empty cell. Returns `True` if written.
+  2. Wire into `ExportDLCCSV.do_action` (`commands.py:1272`): after the existing
+     keypoint CSV write(s) succeed, also write `FrameLabels_<scorer>.csv` into
+     `provenance["image_folder"]` (single **and** dual mode — one file in the
+     shared image folder). Use the same overwrite-confirmation convention as the
+     keypoint CSV. Extend the status-bar message to name the frame-labels file.
+  3. The frame-labels CSV should write even if the project has frame labels but
+     no instances (it is independent of keypoints) — but keep the existing
+     "no user labels → nothing to export" guard for the keypoint CSV path only.
+- **Accept:**
+  - Sow project with labels on ≥5 frames → File → Export DLC CSV →
+    `FrameLabels_jiale.csv` lands next to `CollectedData_jiale.csv`; header is
+    exactly `image,lying,heat_lamp,food`; one row per image; unset cells blank;
+    `heat_lamp` cells read `not_clear` (no space); `food` cells read `3/2/1/0`.
+  - The keypoint CSV(s) are byte-identical to a pre-T21 export (no regression).
+  - Dual project → exactly one `FrameLabels_jiale.csv` in the shared image
+    folder; the two `CollectedData_jiale.csv` files unchanged.
+  - Re-export over an existing `FrameLabels` file → same overwrite-confirm
+    behavior as the keypoint CSV.
+
+### T22. End-to-end smoke test — frame labels ⬜
+- **Depends on:** T19–T21, T6f
+- **Do:** Full GUI flow on the sow project: New DLC Project → label ≥5 frames'
+  keypoints → on each, set `lying`/`heat lamp`/`food` from the dropdowns; use
+  `2` on later frames to carry labels forward, then tweak. Save `.slp` → close →
+  reopen → confirm all dropdown values survived. Export DLC CSV → open
+  `FrameLabels_<scorer>.csv` and the keypoint CSV. Repeat the save/reload +
+  export on the dual project.
+- **Accept:** Reopened project shows every previously-set dropdown value (no
+  rework). `FrameLabels_<scorer>.csv` matches the dropdown values with space-free
+  tokens and blank unset cells; keypoint CSV(s) unchanged. `docs/PROGRESS.md`
+  captures the result. (No server-side step — the frame-labels CSV is downstream
+  research data, not consumed by `csv_to_h5_official.py`.)

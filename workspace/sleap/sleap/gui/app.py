@@ -100,6 +100,7 @@ from qtpy.QtWidgets import QApplication, QMainWindow, QMessageBox
 import sleap
 from sleap.gui.color import ColorManager
 from sleap.gui.commands import AddInstance, CommandContext, UpdateTopic
+from sleap.gui.dataviews import FRAME_LABEL_FIELDS
 from sleap.gui.dialogs.metrics import MetricsTableDialog
 from sleap.gui.dialogs.shortcuts import ShortcutDialog
 from sleap.gui.overlays.instance import InstanceOverlay
@@ -838,6 +839,27 @@ class MainWindow(QMainWindow):
             )
             for _ in range(n_to_copy):
                 self.commands.newInstance(init_method="prior_frame")
+
+            # T20: also carry the three frame-level environment labels forward
+            # from the prior frame. Runs even when n_to_copy == 0 (current frame
+            # already has its instances) so the labels still propagate on `2`.
+            # Only fields set in the prior frame overwrite; unset fields are
+            # left untouched on the current frame.
+            prior_labels = self.labels.provenance.get("frame_labels", {}).get(
+                str(prev_idx), {}
+            )
+            copied_any = False
+            for field in FRAME_LABEL_FIELDS:
+                val = prior_labels.get(field, "")
+                if val:
+                    self.commands.setFrameLabel(
+                        frame_idx=current_lf.frame_idx, field=field, value=val
+                    )
+                    copied_any = True
+            if copied_any:
+                self.dlc_frames_dock.model.refresh_frame_label_cells(
+                    current_lf.frame_idx
+                )
 
         add_menu_item(
             labelMenu,
